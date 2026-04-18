@@ -17,7 +17,7 @@ Usage:
     python playback_pairs.py session_001_pairs.jsonl --speed 0.5   # half speed
     python playback_pairs.py session_001_pairs.jsonl --skip-idle   # skip idle frames
 
-Action string format (Lumine paper):
+Action string format:
     DX DY DZ ; chunk1 ; chunk2 ; chunk3 ; chunk4 ; chunk5 ; chunk6
     Each chunk = comma-separated keys held during that 33ms sub-window.
 """

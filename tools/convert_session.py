@@ -2,7 +2,7 @@
 convert_session.py
 ──────────────────
 Converts a session folder (session_NNN.jsonl + session_NNN.mkv + meta.json)
-into Lumine-style (frame_path, action_string) pairs ready for model training.
+into (frame_path, action_string) pairs ready for model training.
 
 Two modes:
   1. Full mode (default) — requires .mkv + ffmpeg:
@@ -13,7 +13,7 @@ Two modes:
        No video needed. Synthetic frame indices only.
        Output: pairs.jsonl with frame_index + action (no images).
 
-Action string format (Lumine paper):
+Action string format:
     DX DY DZ ; chunk1 ; chunk2 ; chunk3 ; chunk4 ; chunk5 ; chunk6
 
 Requires ffmpeg on PATH for frame extraction.
@@ -409,7 +409,7 @@ def convert(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert session folder → Lumine-style (frame, action) pairs."
+        description="Convert session folder → (frame, action) pairs."
     )
     parser.add_argument(
         "input",
