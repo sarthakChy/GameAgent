@@ -2,19 +2,29 @@
 input_recorder_orchestrator.py
 ───────────────────────────────
 Runs silently in the background while you play.
+Coordinates both input logging (windows_input_recorder.py) and
+OBS screen recording (obs_recorder.py) from a single hotkey.
 
-  F9  → start a new recording session   (two short beeps)
-  F10 → stop the current session         (one low beep)
+  F9  → start input logger + OBS recording  (two short beeps)
+  F10 → stop both + write meta.json          (one low beep)
 
 Both keys are suppressed — the game never sees them.
-Output files are auto-numbered in root-level recordings/session_NNN/ folders.
+Output per session (recordings/session_NNN/):
+    session_NNN.jsonl       <- keyboard + mouse log
+    session_NNN.mkv         <- OBS screen recording
+    session_NNN_meta.json   <- timestamps for alignment in convert_session.py
+
+OBS WebSocket config (from .env or CLI):
+    OBS_HOST     = localhost
+    OBS_PORT     = 4455
+    OBS_PASSWORD = your_password
 
 Usage
 ─────
   python input_recorder_orchestrator.py
   python input_recorder_orchestrator.py --output-dir C:\\recordings
-  python input_recorder_orchestrator.py --start-key f9 --stop-key f10
-  python input_recorder_orchestrator.py --poll-interval-ms 5
+  python input_recorder_orchestrator.py --no-obs          # input only, no OBS
+  python input_recorder_orchestrator.py --obs-host localhost --obs-port 4455
 
 Then alt-tab to the game and forget about the terminal.
 Press Ctrl+C in the terminal (or close it) to fully exit.
@@ -23,6 +33,8 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
+import os
 import platform
 import re
 import threading
@@ -31,6 +43,12 @@ import winsound
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 if platform.system() != "Windows":
     raise SystemExit("This orchestrator is Windows-only.")
@@ -49,6 +67,23 @@ _spec = importlib.util.spec_from_file_location("windows_input_recorder", _RECORD
 _mod = importlib.util.module_from_spec(_spec)          # type: ignore[arg-type]
 _spec.loader.exec_module(_mod)                         # type: ignore[union-attr]
 InputRecorder = _mod.InputRecorder
+
+# ── Import OBSRecorder from sibling file ───────────────────────────────────
+_OBS_RECORDER_PATH = _HERE / "obs_recorder.py"
+_obs_mod = None
+OBSRecorder = None
+
+if _OBS_RECORDER_PATH.exists():
+    try:
+        _obs_spec = importlib.util.spec_from_file_location("obs_recorder", _OBS_RECORDER_PATH)
+        _obs_mod = importlib.util.module_from_spec(_obs_spec)   # type: ignore[arg-type]
+        _obs_spec.loader.exec_module(_obs_mod)                   # type: ignore[union-attr]
+        OBSRecorder = _obs_mod.OBSRecorder
+    except BaseException as _obs_import_err:
+        print(f"[warn] Could not import obs_recorder.py: {_obs_import_err}")
+        print("[warn] OBS recording will be disabled.")
+else:
+    print("[warn] obs_recorder.py not found — OBS recording disabled.")
 
 # ── Minimal Win32 bindings needed for the global hotkey hook ───────────────
 from ctypes import wintypes
@@ -109,21 +144,64 @@ def _beep_already_running_sync() -> None:
 
 # ── Session file naming ─────────────────────────────────────────────────────
 
-def _next_session_path(output_dir: Path) -> Path:
+def _next_session_dir(output_dir: Path) -> tuple[Path, str]:
     """
-    Returns output_dir/session_NNN/session_NNN.jsonl where NNN is one
-    higher than the highest existing session folder (or 001 if none exist).
+    Returns (session_dir, session_name) where session_name is e.g. 'session_001'.
+    Creates session_dir. NNN is one higher than the highest existing session folder.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     existing = sorted(p for p in output_dir.iterdir() if p.is_dir() and re.fullmatch(r"session_\d{3}", p.name))
     if not existing:
-        session_dir = output_dir / "session_001"
-        return session_dir / "session_001.jsonl"
-    last = existing[-1].name
-    m = re.search(r"(\d+)$", last)
-    n = int(m.group(1)) + 1 if m else 1
-    session_dir = output_dir / f"session_{n:03d}"
-    return session_dir / f"session_{n:03d}.jsonl"
+        name = "session_001"
+    else:
+        last = existing[-1].name
+        m = re.search(r"(\d+)$", last)
+        n = int(m.group(1)) + 1 if m else 1
+        name = f"session_{n:03d}"
+    session_dir = output_dir / name
+    session_dir.mkdir(parents=True, exist_ok=True)
+    return session_dir, name
+
+
+def _compute_obs_input_offset_ms(input_log_path: Path, obs_started_utc_str: str) -> float:
+    """
+    Compute how many ms into the input log the OBS video starts.
+
+    Positive → input log started before OBS (trim input log start in convert_session).
+    Negative → OBS started before input log (trim video start in post — rare).
+
+    Method:
+      session_start event gives wall_time_utc + elapsed_ms.
+      Input zero point = session_start.wall_time_utc - session_start.elapsed_ms.
+      offset_ms = (obs_first_frame_wall - input_zero_wall) in ms.
+    """
+    from datetime import timedelta
+
+    session_start_wall_utc   = None
+    session_start_elapsed_ms = None
+
+    with open(input_log_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if e.get("event_type") == "session_start":
+                session_start_wall_utc   = e.get("wall_time_utc")
+                session_start_elapsed_ms = e.get("elapsed_ms", 0.0)
+                break
+
+    if session_start_wall_utc is None:
+        raise ValueError("No session_start event found in input log")
+
+    session_start_dt   = datetime.fromisoformat(session_start_wall_utc)
+    input_zero_wall_dt = session_start_dt - timedelta(milliseconds=session_start_elapsed_ms)
+    obs_started_dt     = datetime.fromisoformat(obs_started_utc_str)
+
+    return round((obs_started_dt - input_zero_wall_dt).total_seconds() * 1000, 3)
 
 
 # ── Orchestrator ────────────────────────────────────────────────────────────
@@ -135,16 +213,26 @@ class Orchestrator:
         start_key: str = "f9",
         stop_key: str  = "f10",
         poll_interval_ms: int = 5,
+        obs_host: str = "localhost",
+        obs_port: int = 4455,
+        obs_password: str = "",
+        use_obs: bool = True,
     ):
         self.output_dir       = output_dir
         self.start_key        = start_key.lower()
         self.stop_key         = stop_key.lower()
         self.poll_interval_ms = poll_interval_ms
+        self.obs_host         = obs_host
+        self.obs_port         = obs_port
+        self.obs_password     = obs_password
+        # Disable OBS if module not available or explicitly disabled
+        self.use_obs          = use_obs and (OBSRecorder is not None)
 
         self._recorder: Optional[InputRecorder] = None
+        self._obs_recorder: Optional[object]    = None   # OBSRecorder instance
         self._recorder_lock   = threading.Lock()
         self._hook_handle: Optional[int] = None
-        self._hook_ref: Optional[object]  = None   # keep alive — GC would crash Python
+        self._hook_ref: Optional[object]  = None
         self._thread_id: Optional[int]    = None
         self._quit_event      = threading.Event()
 
@@ -153,11 +241,14 @@ class Orchestrator:
     def run(self) -> None:
         """Block until Ctrl+C or the process is killed."""
         self._install_hook()
+
+        obs_status = f"OBS @ {self.obs_host}:{self.obs_port}" if self.use_obs else "OBS disabled"
         print(
             f"\n  Orchestrator ready.\n"
             f"  [{self.start_key.upper()}] start recording\n"
             f"  [{self.stop_key.upper()}]  stop  recording\n"
-            f"  Output → {self.output_dir}\n"
+            f"  Output -> {self.output_dir}\n"
+            f"  {obs_status}\n"
             f"  (Ctrl+C here to exit)\n"
         )
         try:
@@ -234,42 +325,130 @@ class Orchestrator:
     def _on_start_key(self) -> None:
         with self._recorder_lock:
             if self._recorder is not None:
-                # Already recording — warn the user
                 _beep_already_running()
                 print("[!] Already recording. Press F10 to stop first.")
                 return
 
-            path = _next_session_path(self.output_dir)
-            print(f"\n▶  Recording started → {path.name}")
+            session_dir, session_name = _next_session_dir(self.output_dir)
+            print(f"\n▶  Session: {session_name}  ->  {session_dir}")
+
+            # ── Start OBS first (it takes longer to init) ──────────────────
+            obs_started_utc = None
+            if self.use_obs:
+                try:
+                    self._obs_recorder = OBSRecorder(
+                        session_dir  = session_dir,
+                        session_name = session_name,
+                        host         = self.obs_host,
+                        port         = self.obs_port,
+                        password     = self.obs_password,
+                    )
+                    self._obs_recorder.connect()
+                    obs_started_utc = self._obs_recorder.start_recording()
+                    print(f"  OBS recording started at {obs_started_utc}")
+                except Exception as exc:
+                    print(f"  [warn] OBS failed: {exc}")
+                    print("  [warn] Continuing with input logging only.")
+                    self._obs_recorder = None
+
+            # ── Start input recorder ───────────────────────────────────────
+            input_path = session_dir / f"{session_name}.jsonl"
             self._recorder = InputRecorder(
-                output_path     = path,
-                stop_key        = "__never__",   # we handle stop ourselves
-                poll_interval_ms= self.poll_interval_ms,
-                suppress_keys   = {self.start_key, self.stop_key},
+                output_path      = input_path,
+                stop_key         = "__never__",
+                poll_interval_ms = self.poll_interval_ms,
+                suppress_keys    = {self.start_key, self.stop_key},
             )
 
+            # ── Write meta.json with both start timestamps ─────────────────
+            meta = {
+                "session_name":       session_name,
+                "input_log":          str(input_path),
+                "obs_video":          str(session_dir / f"{session_name}.mkv") if self.use_obs else None,
+                "obs_started_utc":    obs_started_utc,
+                "input_started_utc":  datetime.now(timezone.utc).isoformat(),
+                # offset_ms filled in after stop (needs input session_start elapsed_ms)
+                "obs_input_offset_ms": None,
+            }
+            meta_path = session_dir / f"{session_name}_meta.json"
+            meta_path.write_text(json.dumps(meta, indent=2))
+            self._meta_path    = meta_path
+            self._session_name = session_name
+            self._session_dir  = session_dir
+
         _beep_start()
-        # Run the recorder's blocking message loop in a background thread
         threading.Thread(target=self._recorder.start, daemon=True, name="RecorderLoop").start()
 
     def _on_stop_key(self) -> None:
         with self._recorder_lock:
             if self._recorder is None:
-                return   # nothing running, ignore silently
+                return
             r = self._recorder
-            self._recorder = None
+            obs_r = self._obs_recorder
+            meta_path = getattr(self, "_meta_path", None)
+            self._recorder     = None
+            self._obs_recorder = None
 
         _beep_stop()
+
+        # ── Stop input recorder ────────────────────────────────────────────
         r.close()
-        print("■  Recording stopped.\n")
+        print("■  Input recording stopped.")
+
+        # ── Stop OBS ──────────────────────────────────────────────────────
+        if obs_r is not None:
+            try:
+                mkv_path = obs_r.stop_recording()
+                obs_r.disconnect()
+                print(f"■  OBS recording stopped -> {mkv_path}")
+            except Exception as exc:
+                print(f"  [warn] OBS stop failed: {exc}")
+
+        # ── Update meta.json with computed offset ──────────────────────────
+        # offset = how many ms into the input log the video starts.
+        # We derive it by comparing OBS first-frame wall time against the
+        # input logger's zero point (session_start.wall_time_utc - elapsed_ms).
+        if meta_path and meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+                meta["stopped_utc"] = datetime.now(timezone.utc).isoformat()
+
+                # Compute offset from the input log's session_start event
+                input_log_path = Path(meta.get("input_log", ""))
+                obs_started_utc_str = meta.get("obs_started_utc")
+
+                if input_log_path.exists() and obs_started_utc_str:
+                    offset_ms = _compute_obs_input_offset_ms(
+                        input_log_path, obs_started_utc_str
+                    )
+                    meta["obs_input_offset_ms"] = offset_ms
+                    print(f"  OBS→input offset: {offset_ms:+.1f}ms "
+                          f"({'OBS started first' if offset_ms < 0 else 'input started first'})")
+
+                meta_path.write_text(json.dumps(meta, indent=2))
+            except Exception as exc:
+                print(f"  [warn] Could not update meta.json: {exc}")
+
+        print("■  Session complete.\n")
+
+        # Single-session mode: after stop, exit orchestrator.
+        self._quit_message_loop()
 
     def _stop_recording(self) -> None:
         """Called on exit to cleanly close any open session."""
         with self._recorder_lock:
             r = self._recorder
-            self._recorder = None
+            obs_r = self._obs_recorder
+            self._recorder     = None
+            self._obs_recorder = None
         if r is not None:
             r.close()
+        if obs_r is not None:
+            try:
+                obs_r.stop_recording()
+                obs_r.disconnect()
+            except Exception:
+                pass
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -277,7 +456,7 @@ class Orchestrator:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Background orchestrator for windows_input_recorder.py.\n"
+            "Background orchestrator: coordinates input logging + OBS recording.\n"
             "Press the start key to begin a session, the stop key to end it.\n"
             "Both keys are suppressed from the game."
         ),
@@ -286,23 +465,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default=str(Path(__file__).resolve().parent.parent / "recordings"),
-        help="Directory to save session JSONL files. Default: <repo>/recordings",
+        help="Directory to save session folders. Default: <repo>/recordings",
     )
     parser.add_argument(
-        "--start-key",
-        default="f9",
-        help="Hotkey to START a recording session. Default: f9",
+        "--start-key", default="f9",
+        help="Hotkey to START a session. Default: f9",
     )
     parser.add_argument(
-        "--stop-key",
-        default="f10",
-        help="Hotkey to STOP a recording session. Default: f10",
+        "--stop-key", default="f10",
+        help="Hotkey to STOP a session. Default: f10",
     )
     parser.add_argument(
-        "--poll-interval-ms",
+        "--poll-interval-ms", type=int, default=5,
+        help="Input state-snapshot interval in ms. Default: 5",
+    )
+    # OBS args — defaults come from .env
+    parser.add_argument(
+        "--obs-host",
+        default=os.getenv("OBS_HOST", os.getenv("OBS_SERVER_IP", "localhost")),
+        help="OBS WebSocket host. Default: OBS_HOST env / localhost",
+    )
+    parser.add_argument(
+        "--obs-port",
         type=int,
-        default=5,
-        help="State-snapshot interval passed to InputRecorder. Default: 5",
+        default=int(os.getenv("OBS_PORT", "4455")),
+        help="OBS WebSocket port. Default: OBS_PORT env / 4455",
+    )
+    parser.add_argument(
+        "--obs-password",
+        default=os.getenv("OBS_PASSWORD", os.getenv("OBS_PASS", "")),
+        help="OBS WebSocket password. Default: OBS_PASSWORD env var",
+    )
+    parser.add_argument(
+        "--no-obs", action="store_true",
+        help="Disable OBS recording — input logging only.",
     )
     return parser.parse_args()
 
@@ -310,10 +506,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     orchestrator = Orchestrator(
-        output_dir      = Path(args.output_dir),
-        start_key       = args.start_key,
-        stop_key        = args.stop_key,
-        poll_interval_ms= args.poll_interval_ms,
+        output_dir       = Path(args.output_dir),
+        start_key        = args.start_key,
+        stop_key         = args.stop_key,
+        poll_interval_ms = args.poll_interval_ms,
+        obs_host         = args.obs_host,
+        obs_port         = args.obs_port,
+        obs_password     = args.obs_password,
+        use_obs          = not args.no_obs,
     )
     orchestrator.run()
 
