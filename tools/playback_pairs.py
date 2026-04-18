@@ -53,6 +53,11 @@ MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP   = 0x0010
 MOUSEEVENTF_MIDDLEDOWN= 0x0020
 MOUSEEVENTF_MIDDLEUP  = 0x0040
+MOUSEEVENTF_XDOWN     = 0x0080
+MOUSEEVENTF_XUP       = 0x0100
+
+XBUTTON1 = 0x0001
+XBUTTON2 = 0x0002
 
 # Virtual key codes for named keys
 VK_MAP: dict[str, int] = {
@@ -96,8 +101,8 @@ VK_MAP: dict[str, int] = {
 }
 
 # Mouse button keys — handled via MOUSEEVENTF_* not VK
-# Names match recorder: lbutton/rbutton/mbutton (avoids clash with arrow keys)
-MOUSE_BUTTON_KEYS = {"lbutton", "rbutton", "mbutton"}
+# Names match recorder: lbutton/rbutton/mbutton/xbutton1/xbutton2
+MOUSE_BUTTON_KEYS = {"lbutton", "rbutton", "mbutton", "xbutton1", "xbutton2"}
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -161,8 +166,16 @@ def _mouse_button_input(button: str, down: bool) -> INPUT:
         ("rbutton", False): MOUSEEVENTF_RIGHTUP,
         ("mbutton", True):  MOUSEEVENTF_MIDDLEDOWN,
         ("mbutton", False): MOUSEEVENTF_MIDDLEUP,
+        ("xbutton1", True):  MOUSEEVENTF_XDOWN,
+        ("xbutton1", False): MOUSEEVENTF_XUP,
+        ("xbutton2", True):  MOUSEEVENTF_XDOWN,
+        ("xbutton2", False): MOUSEEVENTF_XUP,
     }
     inp._input.mi.dwFlags = flags.get((button, down), 0)
+    if button == "xbutton1":
+        inp._input.mi.mouseData = XBUTTON1
+    elif button == "xbutton2":
+        inp._input.mi.mouseData = XBUTTON2
     return inp
 
 
@@ -342,7 +355,6 @@ def playback(
     # Always restored in finally.
     winmm.timeBeginPeriod(1)
 
-    frame_s = (200 / 1000) / speed   # target seconds per frame after speed scaling
     held: set[str] = set()
 
     try:
@@ -357,11 +369,16 @@ def playback(
                 pct = 100 * i / total
                 print(f"  Frame {pair['frame_index']:>5}  ({pct:.0f}%)  held={sorted(held)}", end="\r")
 
-            # Wait out remainder of frame window
+            # Wait until the next included frame's original start time.
+            # This preserves real timing even when idle frames were skipped.
             elapsed = time.perf_counter() - frame_start
-            remaining = frame_s - elapsed
-            if remaining > 0:
-                time.sleep(remaining)
+            if i + 1 < total:
+                current_t = float(pair["t_start_ms"])
+                next_t = float(pairs[i + 1]["t_start_ms"])
+                target_sleep = max((next_t - current_t) / 1000.0 / speed, 0.0)
+                remaining = target_sleep - elapsed
+                if remaining > 0:
+                    time.sleep(remaining)
 
     except KeyboardInterrupt:
         print("\n\nPlayback interrupted.")
@@ -402,4 +419,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    

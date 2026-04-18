@@ -438,7 +438,7 @@ class InputRecorder:
         self,
         output_path: Path,
         stop_key: str = "f10",
-        poll_interval_ms: int = 10,
+        poll_interval_ms: int = 5,
         start_wall_time: Optional[datetime] = None,
         start_perf_ns: Optional[int] = None,
         suppress_keys: Optional[set] = None,
