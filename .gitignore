@@ -20,7 +20,7 @@ dist/
 
 # Generated tool outputs
 tools/files.zip
-tools/recordings/*.jsonl
+recordings/
 
 # Editor and OS files
 .vscode/

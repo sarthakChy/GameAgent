@@ -19,9 +19,9 @@ Where:
 Keys filtered:  f9, f10 (orchestrator hotkeys — never real game input)
 
 Usage:
-    python convert_session.py session_001.jsonl
-    python convert_session.py session_001.jsonl --output pairs.jsonl
-    python convert_session.py session_001.jsonl --fps 5 --chunks 6
+    python convert_session.py recordings/session_001/session_001.jsonl
+    python convert_session.py recordings/session_001/session_001.jsonl --output pairs.jsonl
+    python convert_session.py recordings/session_001/session_001.jsonl --fps 5 --chunks 6
 """
 
 from __future__ import annotations
@@ -275,7 +275,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert windows_input_recorder JSONL → Lumine-style pairs.jsonl"
     )
-    parser.add_argument("input", help="Path to session_NNN.jsonl")
+    parser.add_argument("input", help="Path to recordings/session_NNN/session_NNN.jsonl")
     parser.add_argument(
         "--output", "-o",
         default=None,

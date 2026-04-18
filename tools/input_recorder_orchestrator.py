@@ -7,7 +7,7 @@ Runs silently in the background while you play.
   F10 → stop the current session         (one low beep)
 
 Both keys are suppressed — the game never sees them.
-Output files are auto-numbered: session_001.jsonl, session_002.jsonl, …
+Output files are auto-numbered in root-level recordings/session_NNN/ folders.
 
 Usage
 ─────
@@ -111,17 +111,19 @@ def _beep_already_running_sync() -> None:
 
 def _next_session_path(output_dir: Path) -> Path:
     """
-    Returns output_dir/session_NNN.jsonl where NNN is one higher than
-    the highest existing session file (or 001 if none exist).
+    Returns output_dir/session_NNN/session_NNN.jsonl where NNN is one
+    higher than the highest existing session folder (or 001 if none exist).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    existing = sorted(output_dir.glob("session_*.jsonl"))
+    existing = sorted(p for p in output_dir.iterdir() if p.is_dir() and re.fullmatch(r"session_\d{3}", p.name))
     if not existing:
-        return output_dir / "session_001.jsonl"
-    last = existing[-1].stem          # e.g. "session_007"
+        session_dir = output_dir / "session_001"
+        return session_dir / "session_001.jsonl"
+    last = existing[-1].name
     m = re.search(r"(\d+)$", last)
     n = int(m.group(1)) + 1 if m else 1
-    return output_dir / f"session_{n:03d}.jsonl"
+    session_dir = output_dir / f"session_{n:03d}"
+    return session_dir / f"session_{n:03d}.jsonl"
 
 
 # ── Orchestrator ────────────────────────────────────────────────────────────
@@ -283,8 +285,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="recordings",
-        help="Directory to save session JSONL files. Default: ./recordings",
+        default=str(Path(__file__).resolve().parent.parent / "recordings"),
+        help="Directory to save session JSONL files. Default: <repo>/recordings",
     )
     parser.add_argument(
         "--start-key",
