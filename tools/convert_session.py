@@ -21,7 +21,7 @@ Keys filtered:  f9, f10 (orchestrator hotkeys — never real game input)
 Usage:
     python convert_session.py recordings/session_001/session_001.jsonl
     python convert_session.py recordings/session_001/session_001.jsonl --output pairs.jsonl
-    python convert_session.py recordings/session_001/session_001.jsonl --fps 5 --chunks 6
+    python convert_session.py recordings/session_001/session_001.jsonl --fps 5
 """
 
 from __future__ import annotations
@@ -75,6 +75,11 @@ def find_time_range(events: list[dict]) -> tuple[float, float]:
             start_ms = e["elapsed_ms"]
         if e["event_type"] == "session_end":
             end_ms = e["elapsed_ms"]
+
+    if end_ms == 0.0 and events:
+        end_ms = events[-1]["elapsed_ms"]
+        print("  [warn] no session_end — using last event timestamp")
+
     return start_ms, end_ms
 
 
@@ -145,7 +150,7 @@ def extract_action_events(events: list[dict], start_ms: float, end_ms: float) ->
 def build_action_string(
     window_events: list[dict],
     window_start_ms: float,
-    pre_window_events: list[dict],
+    seed_held: set[str],
 ) -> str:
     """
     Given all events inside one 200ms window (and all action events before it
@@ -162,17 +167,8 @@ def build_action_string(
             dx_total += e.get("dx", 0)
             dy_total += e.get("dy", 0)
 
-    # ── Seed held state from the last pre-window event that carries held state ──
-    # Every event in the useful list now carries accurate held_keys + held_buttons
-    # snapshots (set by extract_action_events). We just take the last one before
-    # this window — keyboard OR mouse_button, whichever came most recently.
-    seed_held: set[str] = set()
-    if pre_window_events:
-        for e in reversed(pre_window_events):
-            if "held_keys" in e or "held_buttons" in e:
-                seed_held = set(e.get("held_keys", []))
-                seed_held |= set(e.get("held_buttons", []))
-                break
+    # Seed held state from the last event before the window boundary.
+    seed_held = set(seed_held)
     seed_held -= IGNORE_KEYS
 
     # ── Build change timeline from events inside the window ───────────────
@@ -186,10 +182,10 @@ def build_action_string(
     # ── For each chunk, replay changes up to chunk_start ─────────────────
     chunks: list[str] = []
     for c in range(CHUNKS):
-        chunk_start = c * CHUNK_MS
+        chunk_end = (c + 1) * CHUNK_MS
         held = set(seed_held)
         for t_rel, key, action in changes:
-            if t_rel < chunk_start:
+            if t_rel < chunk_end:
                 if action == "down":
                     held.add(key)
                 elif action == "up":
@@ -225,30 +221,40 @@ def convert(
 
     written = 0
     skipped_empty = 0
+    IDLE_STR = "0 0 0 ; " + " ; ".join([""] * CHUNKS)
+
+    event_idx = 0
+    seed_held: set[str] = set()
 
     with open(output_path, "w") as out:
         for win_idx in range(total_windows):
             win_start = win_idx * window_ms
             win_end   = win_start + window_ms
+            current_held = set(seed_held)
 
-            # Events that fall inside this window
-            win_events = [
-                e for e in action_events
-                if win_start <= e["t_ms"] < win_end
-            ]
+            while event_idx < len(action_events) and action_events[event_idx]["t_ms"] < win_start:
+                prev_event = action_events[event_idx]
+                if "held_keys" in prev_event or "held_buttons" in prev_event:
+                    current_held = set(prev_event.get("held_keys", [])) | set(prev_event.get("held_buttons", []))
+                event_idx += 1
 
-            # All action events strictly before this window — used to seed held state
-            pre_events = [
-                e for e in action_events
-                if e["t_ms"] < win_start
-            ]
+            win_start_idx = event_idx
+            while event_idx < len(action_events) and action_events[event_idx]["t_ms"] < win_end:
+                event_idx += 1
 
-            action_str = build_action_string(win_events, win_start, pre_events)
+            win_events = action_events[win_start_idx:event_idx]
+
+            action_str = build_action_string(win_events, win_start, current_held)
+
+            for event in win_events:
+                if "held_keys" in event or "held_buttons" in event:
+                    current_held = set(event.get("held_keys", [])) | set(event.get("held_buttons", []))
+
+            seed_held = current_held
 
             # A truly idle window: no mouse movement AND all 6 chunks empty.
             # The idle string is exactly "0 0 0 ;  ;  ;  ;  ;  ; "
             # (six semicolon-separated empty strings, spaces around each ;)
-            IDLE_STR = "0 0 0 ; " + " ; ".join([""] * CHUNKS)
             is_idle = (action_str == IDLE_STR)
 
             record = {

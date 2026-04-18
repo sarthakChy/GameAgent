@@ -225,7 +225,13 @@ def _spread_delta(total: int, n: int) -> list[int]:
     return [sign * (base + (1 if i < rem else 0)) for i in range(n)]
 
 
-def replay_frame(dx: int, dy: int, chunks: list[set[str]], prev_held: set[str]) -> set[str]:
+def replay_frame(
+    dx: int,
+    dy: int,
+    chunks: list[set[str]],
+    prev_held: set[str],
+    warned_keys: set[str],
+) -> set[str]:
     """
     Execute one 200ms frame:
       - Spread mouse delta evenly across all 6 chunks x _MOUSE_SUBSTEPS,
@@ -261,11 +267,17 @@ def replay_frame(dx: int, dy: int, chunks: list[set[str]], prev_held: set[str]) 
                 key_inputs.append(_mouse_button_input(key, False))
             elif key in VK_MAP:
                 key_inputs.append(_key_input(VK_MAP[key], key_up=True))
+            elif key not in warned_keys:
+                print(f"  [warn] unknown key '{key}' — skipped")
+                warned_keys.add(key)
         for key in newly_down:
             if key in MOUSE_BUTTON_KEYS:
                 key_inputs.append(_mouse_button_input(key, True))
             elif key in VK_MAP:
                 key_inputs.append(_key_input(VK_MAP[key], key_up=False))
+            elif key not in warned_keys:
+                print(f"  [warn] unknown key '{key}' — skipped")
+                warned_keys.add(key)
         if key_inputs:
             _send_inputs(key_inputs)
 
@@ -356,13 +368,16 @@ def playback(
     winmm.timeBeginPeriod(1)
 
     held: set[str] = set()
+    warned_keys: set[str] = set()
+    last_frame_idx: int | str | None = None
 
     try:
         for i, pair in enumerate(pairs):
             frame_start = time.perf_counter()
+            last_frame_idx = pair["frame_index"]
 
             dx, dy, chunks = parse_action(pair["action"])
-            held = replay_frame(dx, dy, chunks, held)
+            held = replay_frame(dx, dy, chunks, held, warned_keys)
 
             # Print progress every 50 frames
             if i % 50 == 0:
@@ -385,7 +400,8 @@ def playback(
     finally:
         winmm.timeEndPeriod(1)
         release_all(held)
-        print(f"\nAll keys released. Stopped at frame {pair['frame_index']}.")
+        stopped_at = last_frame_idx if last_frame_idx is not None else "N/A"
+        print(f"\nAll keys released. Stopped at frame {stopped_at}.")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────
