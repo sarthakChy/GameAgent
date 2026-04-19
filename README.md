@@ -144,6 +144,30 @@ Visualize or inspect recorded session pairs:
 python tools/playback_pairs.py recordings/session_001/session_001_pairs.jsonl
 ```
 
+#### Playback Options
+
+- `--start-frame N`: Start playback from a specific frame index
+- `--end-frame N`: Stop playback at a specific frame index (inclusive)
+- `--speed X`: Playback speed multiplier (`0.5` = half speed, `2.0` = double speed)
+- `--skip-idle`: Skip frames where `is_idle=true`
+- `--countdown N`: Seconds to wait before playback starts (time to alt-tab into game)
+- `--keyboard-mode MODE`: Keyboard injection mode (`scancode`, `vk`, `hybrid`)
+
+Keyboard mode behavior:
+- `scancode`: Sends hardware-like scan-code events (recommended for most games)
+- `vk`: Sends virtual-key events (better for normal desktop apps and some menus)
+- `hybrid`: Sends both scan-code and virtual-key events
+
+Game-focused examples:
+
+```bash
+# Recommended first try for games (DirectInput/Raw Input friendly)
+python tools/playback_pairs.py recordings/session_001/session_001_pairs.jsonl --keyboard-mode scancode --countdown 5
+
+# Fallback when key input is inconsistent
+python tools/playback_pairs.py recordings/session_001/session_001_pairs.jsonl --keyboard-mode hybrid --countdown 5
+```
+
 ## Data Formats
 
 ### Input Events Log (`.jsonl`)
@@ -254,6 +278,12 @@ python tools/convert_session.py recordings/session_001/ --no-video
 ### Input Events Missing
 - Verify `_jsonl` file is not corrupted: `python -c "import jsonlines; print(len(list(jsonlines.open(...)))"`
 - Check for null bytes or encoding issues in the log file
+
+### Playback Mouse Works But Keyboard Does Not
+- Use scan-code mode first: `python tools/playback_pairs.py recordings/session_001/session_001_pairs.jsonl --keyboard-mode scancode --countdown 5`
+- If still failing, try hybrid mode: `--keyboard-mode hybrid`
+- Make sure the game and playback script run at the same privilege level (both normal user or both administrator)
+- Disable overlays/hotkeys that may capture keyboard input (Ubisoft, Steam, Discord, Xbox Game Bar, GPU overlays)
 
 ## Advanced
 

@@ -46,6 +46,7 @@ INPUT_MOUSE    = 0
 
 KEYEVENTF_KEYUP       = 0x0002
 KEYEVENTF_SCANCODE    = 0x0008
+KEYEVENTF_EXTENDEDKEY = 0x0001
 MOUSEEVENTF_MOVE      = 0x0001
 MOUSEEVENTF_LEFTDOWN  = 0x0002
 MOUSEEVENTF_LEFTUP    = 0x0004
@@ -58,6 +59,7 @@ MOUSEEVENTF_XUP       = 0x0100
 
 XBUTTON1 = 0x0001
 XBUTTON2 = 0x0002
+MAPVK_VK_TO_VSC = 0
 
 # Virtual key codes for named keys
 VK_MAP: dict[str, int] = {
@@ -104,6 +106,16 @@ VK_MAP: dict[str, int] = {
 # Names match recorder: lbutton/rbutton/mbutton/xbutton1/xbutton2
 MOUSE_BUTTON_KEYS = {"lbutton", "rbutton", "mbutton", "xbutton1", "xbutton2"}
 
+# Keys that must carry KEYEVENTF_EXTENDEDKEY when sent as scan codes.
+EXTENDED_VK_CODES = {
+    0x25, 0x26, 0x27, 0x28,  # arrows
+    0x21, 0x22, 0x23, 0x24,  # page/home/end
+    0x2D, 0x2E,              # insert/delete
+    0x6F,                    # numpad divide
+    0xA3, 0xA5,              # right ctrl / right alt
+    0x5B, 0x5C,              # windows keys
+}
+
 
 class MOUSEINPUT(ctypes.Structure):
     _fields_ = [
@@ -145,6 +157,35 @@ def _key_input(vk: int, key_up: bool) -> INPUT:
     inp._input.ki.wVk = vk
     inp._input.ki.dwFlags = KEYEVENTF_KEYUP if key_up else 0
     return inp
+
+
+def _key_input_scancode(vk: int, key_up: bool) -> INPUT:
+    inp = INPUT()
+    inp.type = INPUT_KEYBOARD
+    scan_code = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)
+    if scan_code == 0:
+        # Fall back to VK path if scan-code mapping is unavailable.
+        return _key_input(vk, key_up)
+
+    flags = KEYEVENTF_SCANCODE
+    if key_up:
+        flags |= KEYEVENTF_KEYUP
+    if vk in EXTENDED_VK_CODES:
+        flags |= KEYEVENTF_EXTENDEDKEY
+
+    inp._input.ki.wVk = 0
+    inp._input.ki.wScan = scan_code
+    inp._input.ki.dwFlags = flags
+    return inp
+
+
+def _key_inputs_for_key(vk: int, key_up: bool, keyboard_mode: str) -> list[INPUT]:
+    if keyboard_mode == "vk":
+        return [_key_input(vk, key_up)]
+    if keyboard_mode == "hybrid":
+        # Send scan-code first (game APIs), then VK (UI/message-loop consumers).
+        return [_key_input_scancode(vk, key_up), _key_input(vk, key_up)]
+    return [_key_input_scancode(vk, key_up)]
 
 
 def _mouse_move_input(dx: int, dy: int) -> INPUT:
@@ -231,6 +272,7 @@ def replay_frame(
     chunks: list[set[str]],
     prev_held: set[str],
     warned_keys: set[str],
+    keyboard_mode: str,
 ) -> set[str]:
     """
     Execute one 200ms frame:
@@ -266,7 +308,7 @@ def replay_frame(
             if key in MOUSE_BUTTON_KEYS:
                 key_inputs.append(_mouse_button_input(key, False))
             elif key in VK_MAP:
-                key_inputs.append(_key_input(VK_MAP[key], key_up=True))
+                key_inputs.extend(_key_inputs_for_key(VK_MAP[key], key_up=True, keyboard_mode=keyboard_mode))
             elif key not in warned_keys:
                 print(f"  [warn] unknown key '{key}' — skipped")
                 warned_keys.add(key)
@@ -274,7 +316,7 @@ def replay_frame(
             if key in MOUSE_BUTTON_KEYS:
                 key_inputs.append(_mouse_button_input(key, True))
             elif key in VK_MAP:
-                key_inputs.append(_key_input(VK_MAP[key], key_up=False))
+                key_inputs.extend(_key_inputs_for_key(VK_MAP[key], key_up=False, keyboard_mode=keyboard_mode))
             elif key not in warned_keys:
                 print(f"  [warn] unknown key '{key}' — skipped")
                 warned_keys.add(key)
@@ -300,14 +342,14 @@ def replay_frame(
     return held
 
 
-def release_all(held: set[str]) -> None:
+def release_all(held: set[str], keyboard_mode: str) -> None:
     """Release all currently held keys/buttons — call on stop."""
     inputs: list[INPUT] = []
     for key in held:
         if key in MOUSE_BUTTON_KEYS:
             inputs.append(_mouse_button_input(key, False))
         elif key in VK_MAP:
-            inputs.append(_key_input(VK_MAP[key], key_up=True))
+            inputs.extend(_key_inputs_for_key(VK_MAP[key], key_up=True, keyboard_mode=keyboard_mode))
     if inputs:
         _send_inputs(inputs)
 
@@ -347,6 +389,7 @@ def playback(
     speed: float = 1.0,
     skip_idle: bool = False,
     countdown_s: int = 3,
+    keyboard_mode: str = "scancode",
 ) -> None:
     pairs = load_pairs(pairs_path, start_frame, end_frame, skip_idle)
     if not pairs:
@@ -359,6 +402,7 @@ def playback(
     print(f"  End frame   : {pairs[-1]['frame_index']} (t={pairs[-1]['t_start_ms']:.0f}ms)")
     print(f"  Speed       : {speed}x")
     print(f"  Skip idle   : {skip_idle}")
+    print(f"  Keyboard    : {keyboard_mode}")
 
     countdown(countdown_s)
 
@@ -377,7 +421,7 @@ def playback(
             last_frame_idx = pair["frame_index"]
 
             dx, dy, chunks = parse_action(pair["action"])
-            held = replay_frame(dx, dy, chunks, held, warned_keys)
+            held = replay_frame(dx, dy, chunks, held, warned_keys, keyboard_mode)
 
             # Print progress every 50 frames
             if i % 50 == 0:
@@ -399,7 +443,7 @@ def playback(
         print("\n\nPlayback interrupted.")
     finally:
         winmm.timeEndPeriod(1)
-        release_all(held)
+        release_all(held, keyboard_mode)
         stopped_at = last_frame_idx if last_frame_idx is not None else "N/A"
         print(f"\nAll keys released. Stopped at frame {stopped_at}.")
 
@@ -421,6 +465,15 @@ def main() -> None:
                         help="Skip frames where is_idle=true")
     parser.add_argument("--countdown", type=int, default=3,
                         help="Seconds to wait before starting (alt-tab time). Default: 3")
+    parser.add_argument(
+        "--keyboard-mode",
+        choices=["scancode", "vk", "hybrid"],
+        default="scancode",
+        help=(
+            "Keyboard injection mode. scancode works better for many games; "
+            "vk matches Win32 key messages; hybrid sends both. Default: scancode"
+        ),
+    )
     args = parser.parse_args()
 
     playback(
@@ -430,6 +483,7 @@ def main() -> None:
         speed       = args.speed,
         skip_idle   = args.skip_idle,
         countdown_s = args.countdown,
+        keyboard_mode = args.keyboard_mode,
     )
 
 
