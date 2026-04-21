@@ -187,9 +187,9 @@ One JSON object per line, recording input events:
 One pair per line, each with frame and action:
 
 ```json
-{"frame_index": 0, "t_start_ms": 0.0, "action": "0 0 0 ; w ; w ; w ; w ; w ; w", "is_idle": false, "frame_path": "/path/to/frames/000001.jpg"}
-{"frame_index": 1, "t_start_ms": 200.0, "action": "5 -3 0 ; w ; w ; w ; ; ; ", "is_idle": false, "frame_path": "/path/to/frames/000002.jpg"}
-{"frame_index": 2, "t_start_ms": 400.0, "action": "0 0 0 ; ; ; ; ; ; ", "is_idle": true, "frame_path": "/path/to/frames/000003.jpg"}
+{"frame_index": 0, "t_start_ms": 0.0, "action": "0 0 0 ; w ; w ; w ; w ; w ; w", "horizontal_scroll_steps": 0, "is_idle": false, "frame_path": "/path/to/frames/000001.jpg"}
+{"frame_index": 1, "t_start_ms": 200.0, "action": "5 -3 0 ; w ; w ; w ; ; ; ", "horizontal_scroll_steps": 0, "is_idle": false, "frame_path": "/path/to/frames/000002.jpg"}
+{"frame_index": 2, "t_start_ms": 400.0, "action": "0 0 0 ; ; ; ; ; ; ", "horizontal_scroll_steps": 1, "is_idle": false, "frame_path": "/path/to/frames/000003.jpg"}
 ```
 
 **Action String Format**:
@@ -197,7 +197,9 @@ One pair per line, each with frame and action:
 DX DY DZ ; chunk1 ; chunk2 ; chunk3 ; chunk4 ; chunk5 ; chunk6
 ```
 
-- `DX, DY, DZ`: Mouse delta movement over the frame window
+- `DX, DY`: Mouse movement over the frame window, clamped to `[-999, 999]`
+- `DZ`: Vertical scroll steps over the frame window, clamped to `[-5, 5]`
+- `horizontal_scroll_steps`: Horizontal scroll steps over the frame window, clamped to `[-5, 5]`
 - 6 chunks: Each chunk represents a 33ms sub-window; contains comma-separated key/button names held during that chunk
 - Empty chunk `""` means no keys/buttons held
 

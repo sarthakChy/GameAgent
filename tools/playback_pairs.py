@@ -19,7 +19,7 @@ Usage:
 
 Action string format:
     DX DY DZ ; chunk1 ; chunk2 ; chunk3 ; chunk4 ; chunk5 ; chunk6
-    Each chunk = comma-separated keys held during that 33ms sub-window.
+        Each chunk = comma-separated keys held during that 33ms sub-window.
 """
 from __future__ import annotations
 
@@ -56,6 +56,9 @@ MOUSEEVENTF_MIDDLEDOWN= 0x0020
 MOUSEEVENTF_MIDDLEUP  = 0x0040
 MOUSEEVENTF_XDOWN     = 0x0080
 MOUSEEVENTF_XUP       = 0x0100
+MOUSEEVENTF_WHEEL     = 0x0800
+MOUSEEVENTF_HWHEEL    = 0x1000
+WHEEL_DELTA_PER_STEP  = 120
 
 XBUTTON1 = 0x0001
 XBUTTON2 = 0x0002
@@ -220,27 +223,33 @@ def _mouse_button_input(button: str, down: bool) -> INPUT:
     return inp
 
 
+def _mouse_wheel_input(delta: int, horizontal: bool = False) -> INPUT:
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp._input.mi.mouseData = ctypes.c_ulong(delta & 0xFFFFFFFF).value
+    inp._input.mi.dwFlags = MOUSEEVENTF_HWHEEL if horizontal else MOUSEEVENTF_WHEEL
+    return inp
+
+
 # ── Action string parser ───────────────────────────────────────────────────
 
-def parse_action(action_str: str) -> tuple[int, int, list[set[str]]]:
+def parse_action(action_str: str) -> tuple[int, int, int, list[set[str]]]:
     """
     Parse 'DX DY DZ ; c1 ; c2 ; c3 ; c4 ; c5 ; c6'
-    Returns (dx, dy, [chunk_set, ...])
+    Returns (dx, dy, dz, [chunk_set, ...])
     """
     parts = [p.strip() for p in action_str.split(";")]
     mouse_part = parts[0].split()
     dx = int(mouse_part[0]) if len(mouse_part) > 0 else 0
     dy = int(mouse_part[1]) if len(mouse_part) > 1 else 0
+    dz = int(mouse_part[2]) if len(mouse_part) > 2 else 0
 
     chunks: list[set[str]] = []
     for chunk_str in parts[1:]:
-        if chunk_str:
-            keys = {k.strip() for k in chunk_str.split(",") if k.strip()}
-        else:
-            keys = set()
+        keys = {k.strip() for k in chunk_str.split(",") if k.strip()}
         chunks.append(keys)
 
-    return dx, dy, chunks
+    return dx, dy, dz, chunks
 
 
 # ── Core replay logic ──────────────────────────────────────────────────────
@@ -269,6 +278,8 @@ def _spread_delta(total: int, n: int) -> list[int]:
 def replay_frame(
     dx: int,
     dy: int,
+    dz: int,
+    horizontal_scroll_steps: int,
     chunks: list[set[str]],
     prev_held: set[str],
     warned_keys: set[str],
@@ -293,6 +304,12 @@ def replay_frame(
     # Pre-compute per-step mouse deltas that sum exactly to (dx, dy)
     dx_steps = _spread_delta(dx, total_steps)
     dy_steps = _spread_delta(dy, total_steps)
+
+    # Scroll is encoded per frame, not per chunk.
+    if dz != 0:
+        _send_inputs([_mouse_wheel_input(dz * WHEEL_DELTA_PER_STEP, horizontal=False)])
+    if horizontal_scroll_steps != 0:
+        _send_inputs([_mouse_wheel_input(horizontal_scroll_steps * WHEEL_DELTA_PER_STEP, horizontal=True)])
 
     held = set(prev_held)
 
@@ -420,8 +437,9 @@ def playback(
             frame_start = time.perf_counter()
             last_frame_idx = pair["frame_index"]
 
-            dx, dy, chunks = parse_action(pair["action"])
-            held = replay_frame(dx, dy, chunks, held, warned_keys, keyboard_mode)
+            dx, dy, dz, chunks = parse_action(pair["action"])
+            horizontal_scroll_steps = int(pair.get("horizontal_scroll_steps", 0))
+            held = replay_frame(dx, dy, dz, horizontal_scroll_steps, chunks, held, warned_keys, keyboard_mode)
 
             # Print progress every 50 frames
             if i % 50 == 0:

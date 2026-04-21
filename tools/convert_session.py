@@ -16,6 +16,9 @@ Two modes:
 Action string format:
     DX DY DZ ; chunk1 ; chunk2 ; chunk3 ; chunk4 ; chunk5 ; chunk6
 
+Horizontal scroll is written separately per pair as:
+    horizontal_scroll_steps
+
 Requires ffmpeg on PATH for frame extraction.
 
 Usage:
@@ -44,6 +47,13 @@ from pathlib import Path
 WINDOW_MS = 200          # one frame = 200ms  (5 Hz)
 CHUNKS    = 6            # sub-windows per frame = 6 × 33ms
 CHUNK_MS  = WINDOW_MS / CHUNKS
+
+# Paper-aligned action bounds.
+DXY_MIN = -999
+DXY_MAX = 999
+DZ_STEPS_MIN = -5
+DZ_STEPS_MAX = 5
+WHEEL_DELTA_PER_STEP = 120
 
 IGNORE_KEYS = {"f9", "f10"}
 
@@ -147,6 +157,8 @@ def extract_action_events(events: list[dict], start_ms: float, end_ms: float) ->
                            "held_buttons": sorted(held_buttons)})
         elif etype == "mouse_relative":
             useful.append({**e, "t_ms": ms})
+        elif etype == "mouse_scroll":
+            useful.append({**e, "t_ms": ms})
 
     return sorted(useful, key=lambda x: x["t_ms"])
 
@@ -154,12 +166,26 @@ def extract_action_events(events: list[dict], start_ms: float, end_ms: float) ->
 # ── Action string builder ─────────────────────────────────────────────────────
 
 def build_action_string(window_events: list[dict], window_start_ms: float,
-                        seed_held: set[str]) -> str:
+                        seed_held: set[str]) -> tuple[str, int]:
     dx_total = dy_total = 0
+    dz_raw_total = 0
+    hscroll_raw_total = 0
     for e in window_events:
         if e["event_type"] == "mouse_relative":
             dx_total += e.get("dx", 0)
             dy_total += e.get("dy", 0)
+        elif e["event_type"] == "mouse_scroll" and e.get("action") == "vertical":
+            dz_raw_total += e.get("delta", 0)
+        elif e["event_type"] == "mouse_scroll" and e.get("action") == "horizontal":
+            hscroll_raw_total += e.get("delta", 0)
+
+    # Clamp motion to the bounded range expected by training.
+    dx_total = max(DXY_MIN, min(DXY_MAX, dx_total))
+    dy_total = max(DXY_MIN, min(DXY_MAX, dy_total))
+    dz_steps = int(round(dz_raw_total / WHEEL_DELTA_PER_STEP))
+    dz_steps = max(DZ_STEPS_MIN, min(DZ_STEPS_MAX, dz_steps))
+    hscroll_steps = int(round(hscroll_raw_total / WHEEL_DELTA_PER_STEP))
+    hscroll_steps = max(DZ_STEPS_MIN, min(DZ_STEPS_MAX, hscroll_steps))
 
     seed_held = set(seed_held) - IGNORE_KEYS
     changes = [(e["t_ms"] - window_start_ms, e["key"], e["action"])
@@ -176,7 +202,7 @@ def build_action_string(window_events: list[dict], window_start_ms: float,
         held -= IGNORE_KEYS
         chunks.append(",".join(sorted(held)) if held else "")
 
-    return f"{dx_total} {dy_total} 0 ; {' ; '.join(chunks)}"
+    return f"{dx_total} {dy_total} {dz_steps} ; {' ; '.join(chunks)}", hscroll_steps
 
 
 # ── Frame extraction ──────────────────────────────────────────────────────────
@@ -366,7 +392,7 @@ def convert(
                 event_idx += 1
             win_events = action_events[win_start_idx:event_idx]
 
-            action_str = build_action_string(win_events, win_start, current_held)
+            action_str, hscroll_steps = build_action_string(win_events, win_start, current_held)
 
             # Carry seed forward from in-window events
             for e in win_events:
@@ -375,13 +401,14 @@ def convert(
                                     set(e.get("held_buttons", [])))
             seed_held = current_held
 
-            is_idle = (action_str == IDLE_STR)
+            is_idle = (action_str == IDLE_STR and hscroll_steps == 0)
 
             # Frame path — ffmpeg outputs 1-indexed: 000001.jpg for frame 0
             record: dict = {
                 "frame_index": win_idx,
                 "t_start_ms":  round(win_start, 1),
                 "action":      action_str,
+                "horizontal_scroll_steps": hscroll_steps,
                 "is_idle":     is_idle,
             }
             if use_video and n_extracted > 0:
