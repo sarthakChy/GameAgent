@@ -1,2 +1,8 @@
 obsws-python
 python-dotenv
+datasets
+huggingface_hub
+Pillow
+torch
+transformers
+tqdm
