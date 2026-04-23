@@ -3,6 +3,9 @@
 This folder contains the canonical dataset uploader:
 - hf_converter.py
 - vjepa2_extractor.py
+- vjepa2_dataset.py
+- action_model.py
+- train_action_decoder.py
 
 It builds a canonical Hugging Face DatasetDict from converted GAMEAGENT recordings and pushes it to a dataset repo.
 
@@ -260,6 +263,197 @@ python data_processing/vjepa2_extractor.py --max-samples 200
 - If CUDA memory is tight, keep the same script and reduce `--max-samples` for debugging before full runs.
 - If host RAM is limited, always enable `--chunk-size` so samples are flushed to disk continuously.
 - Keep `HF_TOKEN` in notebook secrets where possible instead of hardcoding it in cells.
+
+## Phase 2: PyTorch Dataset + Tokenizer Bridge
+
+Use `vjepa2_dataset.py` to bridge embedding shards and model training.
+
+It provides:
+- `ShardedEmbeddingActionDataset`: lazy row access from shard index JSON
+- `ActionTokenizer`: action string -> integer ids
+- `make_collate_fn`: dynamic batch padding for variable-length action sequences
+
+### Recommended workflow
+
+1. Build/load tokenizer vocabulary from your shard index.
+2. Build dataset from `*.index.json`.
+3. Use DataLoader with `make_collate_fn(tokenizer.pad_id)`.
+
+### Minimal training-side example
+
+```python
+from torch.utils.data import DataLoader
+from data_processing.vjepa2_dataset import (
+	ActionTokenizer,
+	ShardedEmbeddingActionDataset,
+	make_collate_fn,
+)
+
+index_path = "data_processing/outputs/vjepa2_embeddings.index.json"
+vocab_path = "data_processing/outputs/action_vocab.json"
+
+# Build once, then save.
+tokenizer = ActionTokenizer.build_from_index(index_path, min_freq=1)
+tokenizer.save(vocab_path)
+
+# Later you can reload instead:
+# tokenizer = ActionTokenizer.load(vocab_path)
+
+dataset = ShardedEmbeddingActionDataset(
+	index_path=index_path,
+	tokenizer=tokenizer,
+	max_action_tokens=None,
+	pad_to_max_action_tokens=False,
+	shard_cache_size=2,
+)
+
+loader = DataLoader(
+	dataset,
+	batch_size=64,
+	shuffle=True,
+	num_workers=0,
+	collate_fn=make_collate_fn(tokenizer.pad_id),
+)
+
+batch = next(iter(loader))
+print(batch["embedding"].shape)   # [B, D]
+print(batch["action_ids"].shape)  # [B, T_max]
+print(batch["action_length"].shape)
+```
+
+### Tokenization scheme used
+
+Action strings are canonicalized to tokens like:
+- `<action_start>`
+- `dx_<n>`, `dy_<n>`, `dz_<n>`
+- `<group_1>` ... `<group_6>`
+- `key_w`, `key_space`, ...
+- `<empty_group>` (for empty key groups)
+- `<action_end>`
+
+This keeps sequence structure explicit and easy to debug.
+
+## Phase 3: Action Decoder (The Brain)
+
+Use `action_model.py` to map V-JEPA embeddings to action token sequences.
+
+Implemented model:
+- `MiniTransformerActionDecoder`: compact autoregressive decoder conditioned on one visual context token.
+
+Why this default:
+- Works naturally with the tokenizer/vocabulary you already built.
+- Handles variable-length action sequences.
+- Preserves ordering across action groups and special tokens.
+
+### Minimal training-side example
+
+```python
+import torch
+from data_processing.action_model import MiniTransformerActionDecoder, make_teacher_forcing_batch
+
+# From tokenizer/dataset setup
+vocab_size = len(tokenizer.token_to_id)
+pad_id = tokenizer.pad_id
+start_id = tokenizer.token_to_id["<action_start>"]
+
+model = MiniTransformerActionDecoder(
+	vocab_size=vocab_size,
+	vision_dim=batch["embedding"].shape[-1],
+	d_model=256,
+	nhead=8,
+	num_layers=4,
+	max_seq_len=128,
+	pad_id=pad_id,
+).to("cuda" if torch.cuda.is_available() else "cpu")
+
+vision = batch["embedding"].to(model.lm_head.weight.device)          # [B, D]
+target_ids = batch["action_ids"].to(model.lm_head.weight.device)     # [B, T]
+
+input_ids, labels = make_teacher_forcing_batch(
+	target_ids,
+	start_id=start_id,
+	pad_id=pad_id,
+)
+
+loss = model.compute_loss(
+	vision_embedding=vision,
+	input_ids=input_ids,
+	target_ids=labels,
+	ignore_index=pad_id,
+)
+loss.backward()
+```
+
+### Inference example
+
+```python
+generated = model.generate(
+	vision_embedding=vision[:1],
+	start_id=start_id,
+	end_id=tokenizer.token_to_id["<action_end>"],
+	max_new_tokens=64,
+)
+
+tokens = tokenizer.decode(generated[0])
+print(tokens)
+```
+
+This module is intentionally small so it can train on solo-developer hardware and cloud notebooks.
+
+## End-to-End Training Script
+
+Use `train_action_decoder.py` to run full Phase 3 training:
+- loads/builds vocabulary
+- loads sharded dataset lazily
+- trains MiniTransformerActionDecoder with teacher forcing
+- runs validation each epoch
+- saves checkpoints + JSONL metrics
+
+### Local run
+
+```powershell
+python .\data_processing\train_action_decoder.py `
+	--index-path .\data_processing\outputs\vjepa2_embeddings.index.json `
+	--vocab-path .\data_processing\outputs\action_vocab.json `
+	--epochs 10 `
+	--batch-size 64 `
+	--learning-rate 3e-4 `
+	--device cuda `
+	--use-amp
+```
+
+### With explicit validation index
+
+```powershell
+python .\data_processing\train_action_decoder.py `
+	--index-path .\data_processing\outputs\train.index.json `
+	--val-index-path .\data_processing\outputs\val.index.json `
+	--vocab-path .\data_processing\outputs\action_vocab.json `
+	--device cuda `
+	--use-amp
+```
+
+### Cloud notebook run (Colab/Kaggle)
+
+```bash
+python data_processing/train_action_decoder.py \
+	--index-path /content/vjepa2_embeddings.index.json \
+	--vocab-path /content/action_vocab.json \
+	--epochs 10 \
+	--batch-size 64 \
+	--device cuda \
+	--use-amp
+```
+
+### Outputs
+
+Each run creates a timestamped directory under:
+- `data_processing/outputs/action_decoder_runs/`
+
+Inside each run directory:
+- `best.pt` (best validation checkpoint)
+- `epoch_XXX.pt` (periodic checkpoints)
+- `metrics.jsonl` (epoch-wise train/val loss + learning rate)
 
 ## Dataset card behavior
 

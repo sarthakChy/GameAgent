@@ -106,18 +106,25 @@ def get_token(cli_token: str | None) -> str | None:
     return cli_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
 
 
-def to_sorted_session_rows(dataset, selected_sessions: set[str] | None) -> dict[str, list[dict]]:
-    grouped: dict[str, list[dict]] = {}
-    for row in dataset:
-        episode_id = str(row["episode_id"])
+def to_sorted_session_indices(dataset, selected_sessions: set[str] | None) -> dict[str, list[int]]:
+    grouped: dict[str, list[tuple[int, int]]] = {}
+
+    # Pull only text/numeric columns so HF does not decode image data here.
+    episode_ids = dataset["episode_id"]
+    frame_indices = dataset["frame_index"]
+
+    for row_idx in range(len(dataset)):
+        episode_id = str(episode_ids[row_idx])
         if selected_sessions and episode_id not in selected_sessions:
             continue
-        grouped.setdefault(episode_id, []).append(row)
+        grouped.setdefault(episode_id, []).append((row_idx, int(frame_indices[row_idx])))
 
-    for episode_id in grouped:
-        grouped[episode_id].sort(key=lambda r: int(r["frame_index"]))
+    final_grouped: dict[str, list[int]] = {}
+    for episode_id, items in grouped.items():
+        sorted_items = sorted(items, key=lambda pair: pair[1])
+        final_grouped[episode_id] = [row_idx for row_idx, _ in sorted_items]
 
-    return grouped
+    return final_grouped
 
 
 def extract_vision_tokens(model, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -205,7 +212,7 @@ def main() -> None:
     dataset = load_dataset(args.dataset_repo, split=args.split, token=token)
 
     selected_sessions = set(args.sessions) if args.sessions else None
-    sessions = to_sorted_session_rows(dataset, selected_sessions)
+    sessions = to_sorted_session_indices(dataset, selected_sessions)
     if not sessions:
         raise SystemExit("No matching rows found for selected filters.")
 
@@ -233,12 +240,13 @@ def main() -> None:
     }
 
     session_items = sorted(sessions.items(), key=lambda kv: kv[0])
-    for episode_id, rows in session_items:
+    for episode_id, indices in session_items:
         idle_streak = 0
-        print(f"Processing {episode_id}: {len(rows)} frames")
+        print(f"Processing {episode_id}: {len(indices)} frames")
 
-        for idx in tqdm(range(len(rows)), desc=f"{episode_id}", leave=False):
-            row = rows[idx]
+        for idx in tqdm(range(len(indices)), desc=f"{episode_id}", leave=False):
+            hf_idx = indices[idx]
+            row = dataset[hf_idx]
             is_idle = bool(row.get("is_idle", False))
             idle_streak = idle_streak + 1 if is_idle else 0
 
@@ -251,8 +259,8 @@ def main() -> None:
                 dropped_for_idle += 1
                 continue
 
-            clip_rows = rows[idx - args.window_size + 1: idx + 1]
-            clip_frames = [clip_row["image"] for clip_row in clip_rows]
+            clip_indices = indices[idx - args.window_size + 1: idx + 1]
+            clip_frames = [dataset[i]["image"] for i in clip_indices]
 
             with torch.inference_mode():
                 inputs = processor(videos=[clip_frames], return_tensors="pt")
