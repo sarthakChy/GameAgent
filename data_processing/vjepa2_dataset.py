@@ -322,6 +322,79 @@ class ShardedEmbeddingActionDataset(Dataset):
         }
 
 
+class EpisodeSequenceActionDataset(Dataset):
+    """Build contiguous same-episode clips over the base embedding dataset.
+
+    Each item returns a sequence of embeddings from one episode and keeps the
+    action labels from the final timestep. This is the first step toward a
+    recurrent worker: the model can see longer temporal context without
+    changing the existing action tokenization.
+    """
+
+    def __init__(
+        self,
+        base_dataset: Dataset,
+        *,
+        sequence_length: int,
+        stride: int = 1,
+    ) -> None:
+        if sequence_length < 1:
+            raise ValueError("sequence_length must be >= 1")
+        self.base_dataset = base_dataset
+        self.sequence_length = sequence_length
+        self.stride = max(1, stride)
+
+        episodes: dict[str, list[tuple[int, int]]] = {}
+        for index in range(len(base_dataset)):
+            sample = base_dataset[index]
+            episode_id = str(sample["episode_id"])
+            frame_index = int(sample["frame_index"])
+            episodes.setdefault(episode_id, []).append((index, frame_index))
+
+        windows: list[tuple[int, ...]] = []
+        for episode_id in sorted(episodes):
+            ordered = sorted(episodes[episode_id], key=lambda item: item[1])
+            ordered_indices = [index for index, _ in ordered]
+            if len(ordered_indices) < self.sequence_length:
+                continue
+
+            for start in range(0, len(ordered_indices) - self.sequence_length + 1, self.stride):
+                windows.append(tuple(ordered_indices[start : start + self.sequence_length]))
+
+        if not windows:
+            raise ValueError(
+                "No sequence windows could be built; reduce sequence_length or check the episode filters."
+            )
+
+        self._windows = windows
+
+    def __len__(self) -> int:
+        return len(self._windows)
+
+    def __getitem__(self, index: int) -> dict:
+        window = self._windows[index]
+        samples = [self.base_dataset[item_index] for item_index in window]
+        final_sample = samples[-1]
+
+        return {
+            "embedding": torch.stack([sample["embedding"] for sample in samples], dim=0),
+            "action_ids": final_sample["action_ids"],
+            "action_length": int(final_sample["action_ids"].numel()),
+            "action_text": final_sample["action_text"],
+            "sequence_action_texts": [sample["action_text"] for sample in samples],
+            "episode_id": final_sample["episode_id"],
+            "frame_index": int(final_sample["frame_index"]),
+            "sequence_frame_index": torch.tensor([sample["frame_index"] for sample in samples], dtype=torch.long),
+            "t_start_ms": float(final_sample["t_start_ms"]),
+            "sequence_t_start_ms": torch.tensor([sample["t_start_ms"] for sample in samples], dtype=torch.float32),
+            "is_idle": bool(final_sample["is_idle"]),
+            "sequence_is_idle": torch.tensor([sample["is_idle"] for sample in samples], dtype=torch.bool),
+            "horizontal_scroll_steps": int(final_sample["horizontal_scroll_steps"]),
+            "source_session_relpath": final_sample["source_session_relpath"],
+            "game": final_sample["game"],
+        }
+
+
 def make_collate_fn(pad_id: int) -> Callable[[list[dict]], dict]:
     """Creates a collate function with dynamic action padding per batch."""
 
@@ -345,6 +418,42 @@ def make_collate_fn(pad_id: int) -> Callable[[list[dict]], dict]:
             "t_start_ms": torch.tensor([b["t_start_ms"] for b in batch], dtype=torch.float32),
             "is_idle": torch.tensor([b["is_idle"] for b in batch], dtype=torch.bool),
             "game": [b["game"] for b in batch],
+        }
+
+    return collate
+
+
+def make_sequence_collate_fn(pad_id: int) -> Callable[[list[dict]], dict]:
+    """Collate function for contiguous episode clips with a shared final action."""
+
+    def collate(batch: list[dict]) -> dict:
+        embeddings = torch.stack([item["embedding"] for item in batch], dim=0)
+
+        action_lens = torch.tensor([item["action_ids"].numel() for item in batch], dtype=torch.long)
+        max_len = int(action_lens.max().item()) if batch else 0
+        action_ids = torch.full((len(batch), max_len), fill_value=pad_id, dtype=torch.long)
+
+        for i, item in enumerate(batch):
+            n = item["action_ids"].numel()
+            action_ids[i, :n] = item["action_ids"]
+
+        return {
+            "embedding": embeddings,
+            "action_ids": action_ids,
+            "action_length": action_lens,
+            "episode_id": [item["episode_id"] for item in batch],
+            "frame_index": torch.tensor([item["frame_index"] for item in batch], dtype=torch.long),
+            "sequence_frame_index": torch.stack([item["sequence_frame_index"] for item in batch], dim=0),
+            "t_start_ms": torch.tensor([item["t_start_ms"] for item in batch], dtype=torch.float32),
+            "sequence_t_start_ms": torch.stack([item["sequence_t_start_ms"] for item in batch], dim=0),
+            "is_idle": torch.tensor([item["is_idle"] for item in batch], dtype=torch.bool),
+            "sequence_is_idle": torch.stack([item["sequence_is_idle"] for item in batch], dim=0),
+            "horizontal_scroll_steps": torch.tensor(
+                [item["horizontal_scroll_steps"] for item in batch], dtype=torch.long
+            ),
+            "sequence_action_texts": [item["sequence_action_texts"] for item in batch],
+            "source_session_relpath": [item["source_session_relpath"] for item in batch],
+            "game": [item["game"] for item in batch],
         }
 
     return collate

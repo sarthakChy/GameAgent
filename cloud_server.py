@@ -135,15 +135,29 @@ model = MiniTransformerActionDecoder(
     dim_feedforward=int(args["dim_feedforward"]),
     max_seq_len=int(args["max_seq_len"]),
     pad_id=tokenizer.pad_id,
+    temporal_hidden_dim=int(args.get("temporal_hidden_dim", 0)),
+    temporal_num_layers=int(args.get("temporal_num_layers", 1)),
+    temporal_dropout=float(args.get("temporal_dropout", 0.0)),
+    inverse_dynamics_classes=int(args.get("inverse_dynamics_classes", 0)),
+    inverse_dynamics_hidden_dim=int(args.get("inverse_dynamics_hidden_dim", 256)),
 ).eval().to(DEVICE)
 model.load_state_dict(ckpt["model_state"])
 
 client_frame_buffers: dict[str, deque[Image.Image]] = {}
+client_temporal_states: dict[str, torch.Tensor | None] = {}
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "device": DEVICE}
+
+
+@app.post("/reset")
+def reset_client_state(request: Request) -> dict[str, str]:
+    client_id = request.client.host if request.client else "unknown"
+    client_frame_buffers.pop(client_id, None)
+    client_temporal_states.pop(client_id, None)
+    return {"status": "reset", "client_id": client_id}
 
 
 @app.post("/predict")
@@ -158,6 +172,10 @@ async def predict_action(request: Request, file: UploadFile = File(...)) -> dict
     if len(frame_buffer) < frame_buffer.maxlen:
         return {"action": "0 0 0 ; ; ; ; ; ; "}
 
+    temporal_state = client_temporal_states.get(client_id)
+    if temporal_state is not None:
+        temporal_state = temporal_state.to(DEVICE)
+
     with torch.inference_mode():
         if DEVICE == "cuda":
             autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16)
@@ -170,6 +188,7 @@ async def predict_action(request: Request, file: UploadFile = File(...)) -> dict
             except ValueError as exc:
                 # Self-heal if a malformed frame batch slips in during transitions.
                 frame_buffer.clear()
+                client_temporal_states.pop(client_id, None)
                 if "same shape" in str(exc):
                     return {"action": "0 0 0 ; ; ; ; ; ; "}
                 raise
@@ -182,13 +201,16 @@ async def predict_action(request: Request, file: UploadFile = File(...)) -> dict
 
             start_id = tokenizer.token_to_id[ActionTokenizer.ACTION_START]
             end_id = tokenizer.token_to_id[ActionTokenizer.ACTION_END]
-            out_ids = model.generate(
+            out_ids, new_temporal_state = model.generate(
                 embedding,
                 start_id=start_id,
                 end_id=end_id,
                 max_new_tokens=64,
                 temperature=0.1,
+                hidden_state=temporal_state,
+                return_temporal_state=True,
             )
+            client_temporal_states[client_id] = None if new_temporal_state is None else new_temporal_state.detach()
             tokens = tokenizer.decode(out_ids[0])
 
     return {"action": decode_tokens_to_action_string(tokens)}

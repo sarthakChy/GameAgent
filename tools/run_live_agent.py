@@ -209,12 +209,18 @@ def main() -> None:
         dropout=float(ckpt_args.get("dropout", 0.1)),
         max_seq_len=int(ckpt_args.get("max_seq_len", 128)),
         pad_id=tokenizer.pad_id,
+        temporal_hidden_dim=int(ckpt_args.get("temporal_hidden_dim", 0)),
+        temporal_num_layers=int(ckpt_args.get("temporal_num_layers", 1)),
+        temporal_dropout=float(ckpt_args.get("temporal_dropout", 0.0)),
+        inverse_dynamics_classes=int(ckpt_args.get("inverse_dynamics_classes", 0)),
+        inverse_dynamics_hidden_dim=int(ckpt_args.get("inverse_dynamics_hidden_dim", 256)),
     ).eval().to(device)
     model.load_state_dict(ckpt["model_state"])
 
     start_id = tokenizer.token_to_id[ActionTokenizer.ACTION_START]
     end_id = tokenizer.token_to_id[ActionTokenizer.ACTION_END]
     top_k = args.top_k if args.top_k > 0 else None
+    temporal_state: torch.Tensor | None = None
 
     action_queue: queue.Queue[str] = queue.Queue(maxsize=max(1, args.queue_size))
     executor = threading.Thread(
@@ -262,14 +268,19 @@ def main() -> None:
                 if embedding.ndim == 1:
                     embedding = embedding.unsqueeze(0)
 
-                out_ids = model.generate(
+                out_ids, temporal_state = model.generate(
                     embedding,
                     start_id=start_id,
                     end_id=end_id,
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     top_k=top_k,
+                    hidden_state=temporal_state,
+                    return_temporal_state=True,
                 )
+
+                if temporal_state is not None:
+                    temporal_state = temporal_state.detach()
 
                 tokens = tokenizer.decode(out_ids[0])
 

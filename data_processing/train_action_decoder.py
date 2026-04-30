@@ -13,8 +13,10 @@ from torch.utils.data import DataLoader, Subset, random_split
 from data_processing.action_model import MiniTransformerActionDecoder, make_teacher_forcing_batch
 from data_processing.vjepa2_dataset import (
     ActionTokenizer,
+    EpisodeSequenceActionDataset,
     ShardedEmbeddingActionDataset,
     make_collate_fn,
+    make_sequence_collate_fn,
 )
 
 
@@ -47,6 +49,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--val-ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        default=8,
+        help="Number of contiguous embedding windows per training sample.",
+    )
+    parser.add_argument(
+        "--sequence-stride",
+        type=int,
+        default=1,
+        help="Stride between contiguous windows when building sequence clips.",
+    )
 
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)
@@ -54,6 +68,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dim-feedforward", type=int, default=1024)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--max-seq-len", type=int, default=128)
+    parser.add_argument(
+        "--temporal-hidden-dim",
+        type=int,
+        default=256,
+        help="Hidden size for the temporal encoder over embedding sequences.",
+    )
+    parser.add_argument(
+        "--temporal-num-layers",
+        type=int,
+        default=1,
+        help="Number of GRU layers used for temporal context encoding.",
+    )
+    parser.add_argument(
+        "--temporal-dropout",
+        type=float,
+        default=0.0,
+        help="Dropout applied between temporal encoder layers.",
+    )
+    parser.add_argument(
+        "--repeat-decay",
+        type=float,
+        default=0.8,
+        help="Loss decay factor for repeated end-of-sequence actions.",
+    )
+    parser.add_argument(
+        "--inverse-dynamics-weight",
+        type=float,
+        default=0.25,
+        help="Weight for the inverse-dynamics auxiliary loss.",
+    )
+    parser.add_argument(
+        "--inverse-dynamics-hidden-dim",
+        type=int,
+        default=256,
+        help="Hidden size used by the inverse-dynamics auxiliary head.",
+    )
 
     parser.add_argument(
         "--device",
@@ -85,23 +135,120 @@ def tokenizer_uses_bucketed_motion(tokenizer: ActionTokenizer) -> bool:
     )
 
 
+def normalize_action_text(action_text: str) -> str:
+    return " ".join(action_text.strip().split())
+
+
+def build_action_signature_vocab(*datasets: object) -> dict[str, int]:
+    signatures: set[str] = set()
+    for dataset in datasets:
+        if dataset is None:
+            continue
+        for index in range(len(dataset)):  # type: ignore[arg-type]
+            sample = dataset[index]  # type: ignore[index]
+            signatures.add(normalize_action_text(str(sample["action_text"])))
+
+    vocab: dict[str, int] = {"<unk_action>": 0}
+    for signature in sorted(signatures):
+        if signature not in vocab:
+            vocab[signature] = len(vocab)
+    return vocab
+
+
+def repeat_streak(sequence_action_texts: list[str]) -> int:
+    if not sequence_action_texts:
+        return 1
+
+    final_action = normalize_action_text(sequence_action_texts[-1])
+    streak = 1
+    for action_text in reversed(sequence_action_texts[:-1]):
+        if normalize_action_text(action_text) != final_action:
+            break
+        streak += 1
+    return streak
+
+
+def action_texts_to_ids(action_texts: list[str], action_signature_to_id: dict[str, int]) -> torch.Tensor:
+    unk_id = action_signature_to_id["<unk_action>"]
+    ids = [action_signature_to_id.get(normalize_action_text(text), unk_id) for text in action_texts]
+    return torch.tensor(ids, dtype=torch.long)
+
+
+def split_dataset_by_episode(
+    dataset: ShardedEmbeddingActionDataset,
+    *,
+    val_ratio: float,
+    seed: int,
+) -> tuple[Subset, Subset]:
+    episode_to_indices: dict[str, list[int]] = {}
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        episode_to_indices.setdefault(str(sample["episode_id"]), []).append(index)
+
+    episode_ids = list(episode_to_indices)
+    if len(episode_ids) < 2:
+        total = len(dataset)
+        val_len = max(1, int(total * val_ratio))
+        train_len = total - val_len
+        if train_len < 1:
+            raise ValueError("Dataset too small for chosen val split.")
+        generator = torch.Generator().manual_seed(seed)
+        train_subset, val_subset = random_split(dataset, lengths=[train_len, val_len], generator=generator)
+        return train_subset, val_subset
+
+    generator = random.Random(seed)
+    generator.shuffle(episode_ids)
+
+    val_episode_count = max(1, int(round(len(episode_ids) * val_ratio)))
+    val_episode_count = min(val_episode_count, len(episode_ids) - 1)
+    val_episode_ids = set(episode_ids[:val_episode_count])
+
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+    for episode_id, indices in episode_to_indices.items():
+        if episode_id in val_episode_ids:
+            val_indices.extend(indices)
+        else:
+            train_indices.extend(indices)
+
+    if not train_indices or not val_indices:
+        raise ValueError("Episode split produced an empty train or validation partition.")
+
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+
+
 def make_datasets(args: argparse.Namespace, tokenizer: ActionTokenizer) -> tuple[Subset | ShardedEmbeddingActionDataset, Subset | ShardedEmbeddingActionDataset]:
+    use_sequence_clips = args.sequence_length > 1
+
     if args.val_index_path:
-        train_ds = ShardedEmbeddingActionDataset(
+        train_base = ShardedEmbeddingActionDataset(
             index_path=args.index_path,
             tokenizer=tokenizer,
             max_action_tokens=args.max_seq_len,
             pad_to_max_action_tokens=False,
             shard_cache_size=2,
         )
-        val_ds = ShardedEmbeddingActionDataset(
+        val_base = ShardedEmbeddingActionDataset(
             index_path=args.val_index_path,
             tokenizer=tokenizer,
             max_action_tokens=args.max_seq_len,
             pad_to_max_action_tokens=False,
             shard_cache_size=2,
         )
-        return train_ds, val_ds
+        if use_sequence_clips:
+            return (
+                EpisodeSequenceActionDataset(
+                    train_base,
+                    sequence_length=args.sequence_length,
+                    stride=args.sequence_stride,
+                ),
+                EpisodeSequenceActionDataset(
+                    val_base,
+                    sequence_length=args.sequence_length,
+                    stride=args.sequence_stride,
+                ),
+            )
+        return train_base, val_base
 
     full_ds = ShardedEmbeddingActionDataset(
         index_path=args.index_path,
@@ -116,6 +263,21 @@ def make_datasets(args: argparse.Namespace, tokenizer: ActionTokenizer) -> tuple
     train_len = total - val_len
     if train_len < 1:
         raise ValueError("Dataset too small for chosen val split.")
+
+    if use_sequence_clips:
+        train_base, val_base = split_dataset_by_episode(full_ds, val_ratio=args.val_ratio, seed=args.seed)
+        return (
+            EpisodeSequenceActionDataset(
+                train_base,
+                sequence_length=args.sequence_length,
+                stride=args.sequence_stride,
+            ),
+            EpisodeSequenceActionDataset(
+                val_base,
+                sequence_length=args.sequence_length,
+                stride=args.sequence_stride,
+            ),
+        )
 
     generator = torch.Generator().manual_seed(args.seed)
     train_ds, val_ds = random_split(full_ds, lengths=[train_len, val_len], generator=generator)
@@ -134,6 +296,9 @@ def train_one_epoch(
     pad_id: int,
     use_amp: bool,
     grad_clip: float,
+    repeat_decay: float,
+    inverse_dynamics_weight: float,
+    action_signature_to_id: dict[str, int],
 ) -> float:
     model.train()
     running_loss = 0.0
@@ -142,6 +307,12 @@ def train_one_epoch(
     for batch in loader:
         vision = batch["embedding"].to(device)
         target_ids = batch["action_ids"].to(device)
+        sequence_action_texts = batch.get("sequence_action_texts")
+
+        sample_weights = None
+        if isinstance(sequence_action_texts, list):
+            repeat_weights = [repeat_decay ** max(0, repeat_streak(actions) - 1) for actions in sequence_action_texts]
+            sample_weights = torch.tensor(repeat_weights, dtype=torch.float32, device=device)
 
         input_ids, labels = make_teacher_forcing_batch(
             target_ids,
@@ -157,7 +328,36 @@ def train_one_epoch(
                 input_ids=input_ids,
                 target_ids=labels,
                 ignore_index=pad_id,
+                sample_weights=sample_weights,
             )
+
+            inverse_loss = torch.zeros((), device=device)
+            if (
+                inverse_dynamics_weight > 0
+                and getattr(model, "inverse_dynamics_head", None) is not None
+                and vision.ndim == 3
+                and vision.size(1) > 1
+                and isinstance(sequence_action_texts, list)
+            ):
+                pair_current = vision[:, :-1, :].reshape(-1, vision.size(-1))
+                pair_next = vision[:, 1:, :].reshape(-1, vision.size(-1))
+                inverse_targets = []
+                for actions in sequence_action_texts:
+                    normalized_actions = [normalize_action_text(action_text) for action_text in actions]
+                    inverse_targets.extend(
+                        action_signature_to_id.get(action_text, action_signature_to_id["<unk_action>"])
+                        for action_text in normalized_actions[:-1]
+                    )
+                target_action_ids = torch.tensor(inverse_targets, dtype=torch.long, device=device)
+                if target_action_ids.numel() > 0:
+                    inverse_loss = model.compute_inverse_dynamics_loss(
+                        pair_current,
+                        pair_next,
+                        target_action_ids,
+                        ignore_index=action_signature_to_id["<unk_action>"] if "<unk_action>" in action_signature_to_id else -100,
+                    )
+
+            loss = loss + inverse_dynamics_weight * inverse_loss
 
         scaler.scale(loss).backward()
 
@@ -263,7 +463,16 @@ def main() -> None:
 
     train_ds, val_ds = make_datasets(args, tokenizer)
 
-    collate_fn = make_collate_fn(tokenizer.pad_id)
+    action_signature_to_id = build_action_signature_vocab(
+        getattr(train_ds, "base_dataset", train_ds),
+        getattr(val_ds, "base_dataset", val_ds),
+    )
+    signature_vocab_path = run_dir / "inverse_action_vocab.json"
+    signature_vocab_path.write_text(json.dumps(action_signature_to_id, indent=2), encoding="utf-8")
+    args.inverse_dynamics_classes = len(action_signature_to_id)
+    args.inverse_action_vocab_path = str(signature_vocab_path)
+
+    collate_fn = make_sequence_collate_fn(tokenizer.pad_id) if args.sequence_length > 1 else make_collate_fn(tokenizer.pad_id)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -295,6 +504,11 @@ def main() -> None:
         dropout=args.dropout,
         max_seq_len=args.max_seq_len,
         pad_id=tokenizer.pad_id,
+        temporal_hidden_dim=args.temporal_hidden_dim,
+        temporal_num_layers=args.temporal_num_layers,
+        temporal_dropout=args.temporal_dropout,
+        inverse_dynamics_classes=len(action_signature_to_id),
+        inverse_dynamics_hidden_dim=args.inverse_dynamics_hidden_dim,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -320,6 +534,9 @@ def main() -> None:
     print(f"  val_samples: {len(val_ds)}")
     print(f"  vocab_size: {len(tokenizer.token_to_id)}")
     print(f"  vision_dim: {vision_dim}")
+    print(f"  sequence_length: {args.sequence_length}")
+    print(f"  temporal_hidden_dim: {args.temporal_hidden_dim}")
+    print(f"  inverse_dynamics_classes: {args.inverse_dynamics_classes}")
     print(f"  device: {device}")
     print(f"  amp: {use_amp}")
 
@@ -335,6 +552,9 @@ def main() -> None:
             pad_id=tokenizer.pad_id,
             use_amp=use_amp,
             grad_clip=args.grad_clip,
+            repeat_decay=args.repeat_decay,
+            inverse_dynamics_weight=args.inverse_dynamics_weight,
+            action_signature_to_id=action_signature_to_id,
         )
 
         val_loss = eval_one_epoch(

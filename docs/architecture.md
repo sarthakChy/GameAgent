@@ -277,3 +277,130 @@ That means the next improvement should not be another data pass over the same on
 ### Bottom line
 
 The architecture brainstorm is sound, but the first implementation boundary is the data/training interface, not the manager. Once the worker can train on contiguous time and carry hidden state, the rest of the roadmap becomes much more likely to pay off.
+
+---
+
+## 9. LSTM Idea, In Simple Terms
+
+The LSTM idea is good because it gives the worker a short-term memory.
+
+Right now, the mini-transformer mostly looks at one visual window and predicts the next token sequence. That works for quick reflexes, but it forgets what happened a few moments ago. An LSTM fixes that by carrying a hidden state forward from one timestep to the next, so the worker can remember things like:
+
+- I was moving forward.
+- I was stuck against a wall.
+- I just opened the inventory.
+- I am still in the middle of an attack or dodge.
+
+In simpler terms, the LSTM lets the agent think, "What was I doing a second ago, and should I keep doing it or change course?"
+
+### Why it is not a drop-in replacement
+
+Your current decoder predicts a full action token string from one visual context. That is a token generator.
+
+The LSTM version changes the shape of the problem. Instead of "one image window in, one token sequence out," it becomes more like "a stream of frames in, a memory state updated each step, and one action prediction per step." That means the training loop, dataset, and sometimes the output format all need to change together.
+
+If you swap only the model class and keep the old training setup, the memory will not really be used properly. The data still arrives as isolated samples, so the LSTM never learns a real before-and-after story.
+
+### The two clean ways to do it
+
+#### Option A: Keep the current token decoder, add an LSTM in front
+
+This is the safer path.
+
+How it works:
+
+- The LSTM reads a sequence of V-JEPA embeddings and builds up memory.
+- The mini-transformer still does the final token generation.
+- The LSTM acts like a temporal adapter, not the final decision maker.
+
+Why this is good:
+
+- It preserves your current action vocabulary.
+- It changes less of the pipeline.
+- It is easier to train and debug.
+
+When to use it:
+
+- You want the smallest possible rewrite.
+- You want to keep the current action-string format.
+- You want memory first, not a full redesign.
+
+#### Option B: Collapse actions into one label per timestep
+
+This is the cleaner sequence-model path.
+
+How it works:
+
+- Each frame or short clip gets one action label, such as `move_forward`, `attack`, `jump`, or `idle`.
+- The LSTM outputs one label at a time.
+- The model learns a direct state-to-action policy.
+
+Why this is good:
+
+- It matches the way recurrent models usually train.
+- It is simpler than generating long token strings.
+- It is easier to use for BPTT and hidden-state training.
+
+When to use it:
+
+- You are willing to change the action representation.
+- You want a more standard recurrent policy.
+- You want the easiest path to true memory training.
+
+### My recommendation
+
+For your current project, start with **Option A** if you want the least disruption.
+
+That means:
+
+1. Keep your current tokenizer and action strings.
+2. Add the LSTM as a temporal memory layer.
+3. Train on contiguous episode clips.
+4. Pass the hidden state forward across time.
+
+Once that works, you can decide whether to stop there or simplify further into Option B later.
+
+### The real first step
+
+The most important change is not the LSTM class itself. It is making the training data sequential.
+
+In practice, that means:
+
+- do not sample unrelated windows,
+- do group frames from the same episode,
+- do carry hidden state across those frames,
+- do reset hidden state when a new episode starts.
+
+That is what gives the LSTM a real memory.
+
+---
+
+## 10. GRU Phase Checkpoint
+
+### What's Working Well
+
+- Backward compatibility: the model still falls back to the original architecture when `temporal_hidden_dim=0`.
+- Episode-aware data loading: `EpisodeSequenceActionDataset` keeps each training clip contiguous within one episode, so the model does not learn from incoherent mixed-session windows.
+- The GRU pattern is correct: using the last hidden state as the context vector is a standard and effective setup for this scale.
+
+### What's Implemented Now
+
+1. Persistent recurrent state at inference: the live server and local agent now keep the GRU hidden state per session and feed it forward across steps instead of recomputing the whole history every time.
+2. Decaying loss: repeated end-of-sequence action streaks are downweighted during training, which makes long `w`-spam and other stuck loops less attractive.
+3. Inverse dynamics auxiliary head: the trainer now learns a transition classifier from consecutive embeddings so the worker gets an explicit causal signal about which action caused which state change.
+
+### What This Means in Simple Terms
+
+The current GRU now behaves more like a true session memory. It still uses short clips of frames to build each V-JEPA observation, but the recurrent state itself is preserved across live inference calls, so the agent can keep track of what it was doing a moment ago.
+
+That is the key difference between a sliding window and a real recurrent agent.
+
+### Priority Order
+
+1. Longer-horizon goal conditioning and state summaries.
+2. A world model for recovery and planning.
+3. Action abstraction if you want portability beyond the current game bindings.
+
+### Bottom Line
+
+The GRU upgrade is now a real recurrent step, not just a windowed encoder. The next meaningful jump is to add higher-level goal and recovery logic on top of this session memory.
