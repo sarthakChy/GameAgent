@@ -2,7 +2,14 @@ obsws-python
 python-dotenv
 datasets
 huggingface_hub
+fastapi
+uvicorn
+requests
 Pillow
 torch
 transformers
+torchvision
+torchaudio
 tqdm
+dxcam
+opencv-python

@@ -78,6 +78,13 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def tokenizer_uses_bucketed_motion(tokenizer: ActionTokenizer) -> bool:
+    return any(
+        token.startswith(("dx_bin_", "dy_bin_", "dz_bin_"))
+        for token in tokenizer.token_to_id
+    )
+
+
 def make_datasets(args: argparse.Namespace, tokenizer: ActionTokenizer) -> tuple[Subset | ShardedEmbeddingActionDataset, Subset | ShardedEmbeddingActionDataset]:
     if args.val_index_path:
         train_ds = ShardedEmbeddingActionDataset(
@@ -243,7 +250,12 @@ def main() -> None:
     vocab_path = Path(args.vocab_path)
     if vocab_path.exists():
         tokenizer = ActionTokenizer.load(vocab_path)
-        print(f"Loaded existing vocab: {vocab_path}")
+        if tokenizer_uses_bucketed_motion(tokenizer):
+            print(f"Loaded bucketized vocab: {vocab_path}")
+        else:
+            print(f"Detected legacy raw-motion vocab, rebuilding bucketized vocab: {vocab_path}")
+            tokenizer = ActionTokenizer.build_from_index(args.index_path, min_freq=args.build_vocab_min_freq)
+            tokenizer.save(vocab_path)
     else:
         tokenizer = ActionTokenizer.build_from_index(args.index_path, min_freq=args.build_vocab_min_freq)
         tokenizer.save(vocab_path)

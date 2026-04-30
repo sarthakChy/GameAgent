@@ -21,6 +21,7 @@ dist/
 # Generated tool outputs
 tools/files.zip
 recordings/
+data_processing/outputs/
 
 # Editor and OS files
 .vscode/

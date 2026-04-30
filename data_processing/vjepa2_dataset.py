@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from bisect import bisect_right
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
@@ -24,7 +25,11 @@ class ActionTokenizer:
     "DX DY DZ ; group1 ; group2 ; group3 ; group4 ; group5 ; group6"
 
     Output token sequence is canonicalized to:
-    <action_start>, dx_<n>, dy_<n>, dz_<n>, <group_1>, ... , <group_6>, <action_end>
+    <action_start>, dx_bin_<n>, dy_bin_<n>, dz_bin_<n>, <group_1>, ... , <group_6>, <action_end>
+
+    Motion values are quantized into 21 signed buckets (-10..10) so the
+    vocabulary stays dense enough to learn from instead of memorizing one-off
+    raw mouse deltas.
 
     Each key inside groups is emitted as key_<name>. Empty groups emit <empty_group>.
     """
@@ -34,6 +39,8 @@ class ActionTokenizer:
     ACTION_START = "<action_start>"
     ACTION_END = "<action_end>"
     EMPTY_GROUP = "<empty_group>"
+    MOTION_BUCKET_MIN = -10
+    MOTION_BUCKET_MAX = 10
 
     def __init__(self, token_to_id: dict[str, int]) -> None:
         self.token_to_id = token_to_id
@@ -51,6 +58,52 @@ class ActionTokenizer:
     @property
     def unk_id(self) -> int:
         return self.token_to_id[self.UNK]
+
+    @classmethod
+    def _quantize_motion_value(cls, value: int) -> int:
+        if value == 0:
+            return 0
+
+        sign = 1 if value > 0 else -1
+        magnitude = abs(int(value))
+        bucket = int(math.ceil(math.log2(magnitude + 1)))
+        bucket = max(1, min(cls.MOTION_BUCKET_MAX, bucket))
+        return sign * bucket
+
+    @classmethod
+    def _dequantize_motion_bucket(cls, bucket: int) -> int:
+        bucket = max(cls.MOTION_BUCKET_MIN, min(cls.MOTION_BUCKET_MAX, int(bucket)))
+        if bucket == 0:
+            return 0
+
+        sign = 1 if bucket > 0 else -1
+        magnitude = 1 << (abs(bucket) - 1)
+        return sign * magnitude
+
+    @classmethod
+    def motion_value_to_token(cls, axis: str, value: int) -> str:
+        if axis not in {"dx", "dy", "dz"}:
+            raise ValueError(f"Unsupported motion axis: {axis}")
+        bucket = cls._quantize_motion_value(value)
+        return f"{axis}_bin_{bucket}"
+
+    @classmethod
+    def motion_token_to_value(cls, token: str) -> int | None:
+        for axis in ("dx", "dy", "dz"):
+            raw_prefix = f"{axis}_"
+            bucket_prefix = f"{axis}_bin_"
+
+            if token.startswith(bucket_prefix):
+                return cls._dequantize_motion_bucket(int(token[len(bucket_prefix) :]))
+
+            if token.startswith(raw_prefix):
+                raw_value = token[len(raw_prefix) :]
+                try:
+                    return int(raw_value)
+                except ValueError:
+                    return None
+
+        return None
 
     @classmethod
     def build_from_index(
@@ -83,9 +136,20 @@ class ActionTokenizer:
             "<group_6>",
         ]
 
+        motion_tokens = [
+            f"{axis}_bin_{bucket}"
+            for axis in ("dx", "dy", "dz")
+            for bucket in range(cls.MOTION_BUCKET_MIN, cls.MOTION_BUCKET_MAX + 1)
+        ]
+
         vocab_tokens: list[str] = []
         seen = set()
         for token in special_tokens:
+            if token not in seen:
+                vocab_tokens.append(token)
+                seen.add(token)
+
+        for token in motion_tokens:
             if token not in seen:
                 vocab_tokens.append(token)
                 seen.add(token)
@@ -120,14 +184,14 @@ class ActionTokenizer:
         if not segments:
             return [cls.ACTION_START, cls.EMPTY_GROUP, cls.ACTION_END]
 
-        mouse_tokens: list[str] = ["dx_0", "dy_0", "dz_0"]
+        mouse_tokens: list[str] = ["dx_bin_0", "dy_bin_0", "dz_bin_0"]
         mouse_parts = [p for p in segments[0].split() if p]
         if len(mouse_parts) >= 1:
-            mouse_tokens[0] = f"dx_{mouse_parts[0]}"
+            mouse_tokens[0] = cls.motion_value_to_token("dx", int(mouse_parts[0]))
         if len(mouse_parts) >= 2:
-            mouse_tokens[1] = f"dy_{mouse_parts[1]}"
+            mouse_tokens[1] = cls.motion_value_to_token("dy", int(mouse_parts[1]))
         if len(mouse_parts) >= 3:
-            mouse_tokens[2] = f"dz_{mouse_parts[2]}"
+            mouse_tokens[2] = cls.motion_value_to_token("dz", int(mouse_parts[2]))
 
         groups = segments[1:7]
         if len(groups) < 6:
