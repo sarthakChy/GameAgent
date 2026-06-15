@@ -140,6 +140,9 @@ model.load_state_dict(ckpt["model_state"])
 
 client_frame_buffers: dict[str, deque[Image.Image]] = {}
 
+@app.get("/")
+def home():
+    return {"server working"}
 
 @app.get("/health")
 def health() -> dict[str, str]:
