@@ -4,35 +4,72 @@
 # Run this once in a fresh Lightning AI studio terminal.
 #
 # What it does:
-#   1. Clones GameAgent and le-wm (gameagent branch)
+#   0. Logs in to HuggingFace and W&B using secrets from environment
+#   1. Clones GameAgent (LeWM branch) and le-wm (gameagent branch)
 #   2. Installs all pip deps
 #   3. Converts HF dataset → gameagent.h5
-#   4. Prints the vocab size
-#   5. Prints the training command to run
+#   4. Prints vocab size
+#   5. Prints the ready-to-run training command
 #
-# Usage:
-#   bash setup_lightning.sh
+# ─── WHERE TO SET SECRETS (Lightning AI) ────────────────────────────────────
+#  In the Lightning AI UI:
+#    Studio → top-right menu → "Secrets" → "+ Add Secret"
 #
-# Env vars you can override:
-#   STABLEWM_HOME   storage root  (default: ~/stable-wm)
-#   HF_TOKEN        HuggingFace token (needed if dataset is private)
-#   WANDB_API_KEY   WandB key (needed if wandb.enabled=true)
+#  Add these two secrets:
+#    HF_TOKEN      → your HuggingFace token  (Settings → Access Tokens on hf.co)
+#    WANDB_API_KEY → your W&B API key        (wandb.ai/authorize)
+#
+#  Lightning AI injects secrets as env vars into every studio terminal
+#  automatically — you never paste tokens into the terminal or this script.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Optional overrides (set before running):
+#   export STABLEWM_HOME=/teamspace/studios/this_studio/storage
 # =============================================================================
 
-set -euo pipefail
+set -eo pipefail   # exit on error; -u removed so optional vars don't abort
 
 # ---------------------------------------------------------------------------
 # Config — edit these if needed
 # ---------------------------------------------------------------------------
 STABLEWM_HOME="${STABLEWM_HOME:-$HOME/stable-wm}"
 GAMEAGENT_REPO="https://github.com/sarthakChy/GameAgent.git"
-GAMEAGENT_BRANCH="LeWM"   # contains converter + vjepa2_dataset.py + plan
+GAMEAGENT_BRANCH="LeWM"    # contains converter + vjepa2_dataset.py + plan
 LEWM_REPO="https://github.com/sarthakChy/le-wm.git"
-LEWM_BRANCH="gameagent"   # contains DiscreteActionEncoder + gameagent configs
+LEWM_BRANCH="gameagent"    # contains DiscreteActionEncoder + gameagent configs
 HF_DATASET="sarthak2314/gameagent-canonical"
 HF_SPLIT="train"
 IMAGE_SIZE=224
 MAX_ACTION_TOKENS=128
+
+# ---------------------------------------------------------------------------
+# 0. Auth — HuggingFace + W&B
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== [0/5] Checking auth ==="
+
+# HuggingFace
+if [ -n "${HF_TOKEN:-}" ]; then
+    echo "  HF_TOKEN found — logging in to HuggingFace"
+    huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential 2>/dev/null || \
+        python -c "from huggingface_hub import login; login('$HF_TOKEN')"
+    echo "  ✓ HuggingFace logged in"
+else
+    echo "  ⚠ HF_TOKEN not set."
+    echo "    If your dataset is private, add it under: Studio → Secrets → HF_TOKEN"
+    echo "    Continuing (will fail at conversion step if dataset is private)."
+fi
+
+# W&B
+if [ -n "${WANDB_API_KEY:-}" ]; then
+    echo "  WANDB_API_KEY found — logging in to W&B"
+    python -c "import wandb; wandb.login(key='$WANDB_API_KEY', relogin=True)" 2>/dev/null
+    echo "  ✓ W&B logged in"
+else
+    echo "  ⚠ WANDB_API_KEY not set."
+    echo "    Add it under: Studio → Secrets → WANDB_API_KEY"
+    echo "    Training will use wandb.enabled=false until you add it."
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Clone repos
@@ -44,13 +81,14 @@ if [ ! -d "GameAgent" ]; then
     git clone -b "$GAMEAGENT_BRANCH" "$GAMEAGENT_REPO" GameAgent
 else
     echo "  GameAgent/ already exists, skipping clone"
-    echo "  (branch should be $GAMEAGENT_BRANCH — check with: cd GameAgent && git branch)"
+    echo "  (should be on branch: $GAMEAGENT_BRANCH)"
 fi
 
 if [ ! -d "le-wm" ]; then
     git clone -b "$LEWM_BRANCH" "$LEWM_REPO" le-wm
 else
     echo "  le-wm/ already exists, skipping clone"
+    echo "  (should be on branch: $LEWM_BRANCH)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -67,7 +105,7 @@ pip install -q "stable-worldmodel[train,format]" \
                h5py \
                hdf5plugin
 
-echo "  deps installed"
+echo "  ✓ deps installed"
 
 # ---------------------------------------------------------------------------
 # 3. Set up STABLEWM_HOME
@@ -89,13 +127,18 @@ echo ""
 echo "=== [4/5] Converting HF dataset to HDF5 ==="
 
 if [ -f "$OUTPUT_H5" ]; then
-    echo "  $OUTPUT_H5 already exists, skipping conversion"
+    echo "  $OUTPUT_H5 already exists — skipping conversion"
     echo "  Delete it and re-run if you want to reconvert."
 else
     BUILD_VOCAB_FLAG=""
     if [ ! -f "$VOCAB_PATH" ]; then
-        echo "  action_vocab.json not found — will build it from dataset"
+        echo "  action_vocab.json not found — will build it from dataset rows"
         BUILD_VOCAB_FLAG="--build-vocab"
+    fi
+
+    HF_TOKEN_ARG=""
+    if [ -n "${HF_TOKEN:-}" ]; then
+        HF_TOKEN_ARG="--hf-token $HF_TOKEN"
     fi
 
     python GameAgent/data_processing/convert_hf_to_lewm_h5.py \
@@ -106,7 +149,8 @@ else
         --image-size "$IMAGE_SIZE" \
         --max-action-tokens "$MAX_ACTION_TOKENS" \
         --mode overwrite \
-        $BUILD_VOCAB_FLAG
+        $BUILD_VOCAB_FLAG \
+        $HF_TOKEN_ARG
 fi
 
 # ---------------------------------------------------------------------------
@@ -125,9 +169,15 @@ except Exception as e:
     sys.exit(1)
 ")
 
+# Decide wandb flag
+WANDB_FLAG="wandb.enabled=false"
+if [ -n "${WANDB_API_KEY:-}" ]; then
+    WANDB_FLAG="wandb.enabled=true wandb.config.entity=<your_entity> wandb.config.project=gameagent-lewm"
+fi
+
 echo ""
-echo "  vocab_size = $VOCAB_SIZE"
-echo "  dataset    = $OUTPUT_H5"
+echo "  vocab_size    = $VOCAB_SIZE"
+echo "  dataset       = $OUTPUT_H5"
 echo "  STABLEWM_HOME = $STABLEWM_HOME"
 echo ""
 echo "=== Run this to start training: ==="
@@ -138,8 +188,10 @@ echo "  python train.py \\"
 echo "    data=gameagent \\"
 echo "    model=lewm_gameagent \\"
 echo "    model.action_encoder.vocab_size=$VOCAB_SIZE \\"
-echo "    wandb.enabled=false"
+echo "    $WANDB_FLAG"
 echo ""
-echo "  (Set wandb.enabled=true and add wandb.config.entity/project for logging)"
-echo ""
-echo "Done. All set up."
+if [ -n "${WANDB_API_KEY:-}" ]; then
+    echo "  (Replace <your_entity> with your W&B username or team name)"
+    echo ""
+fi
+echo "✓ All done."
