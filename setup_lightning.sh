@@ -26,8 +26,9 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 STABLEWM_HOME="${STABLEWM_HOME:-$HOME/stable-wm}"
 GAMEAGENT_REPO="https://github.com/sarthakChy/GameAgent.git"
+GAMEAGENT_BRANCH="LeWM"   # contains converter + vjepa2_dataset.py + plan
 LEWM_REPO="https://github.com/sarthakChy/le-wm.git"
-LEWM_BRANCH="gameagent"
+LEWM_BRANCH="gameagent"   # contains DiscreteActionEncoder + gameagent configs
 HF_DATASET="sarthak2314/gameagent-canonical"
 HF_SPLIT="train"
 IMAGE_SIZE=224
@@ -40,9 +41,10 @@ echo ""
 echo "=== [1/5] Cloning repos ==="
 
 if [ ! -d "GameAgent" ]; then
-    git clone "$GAMEAGENT_REPO" GameAgent
+    git clone -b "$GAMEAGENT_BRANCH" "$GAMEAGENT_REPO" GameAgent
 else
     echo "  GameAgent/ already exists, skipping clone"
+    echo "  (branch should be $GAMEAGENT_BRANCH — check with: cd GameAgent && git branch)"
 fi
 
 if [ ! -d "le-wm" ]; then
