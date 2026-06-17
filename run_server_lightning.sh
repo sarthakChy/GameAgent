@@ -3,79 +3,61 @@
 # Lightning AI — LeWM Inference Server Setup & Launch
 # Run this in a FRESH Lightning AI studio terminal to start the MPC server.
 #
-# What it does:
-#   0. Logs in to HuggingFace (needed to pull checkpoint from HF)
+# Before running, manually upload these files to the studio:
+#   weights_epoch_100.pt  → drag into the file browser, or use the
+#                           Lightning AI "Upload" button in the file panel
+#   gameagent.h5          → same (optional — only needed for dataset candidates)
+#
+# What this script does:
 #   1. Clones GameAgent (LeWM branch) and le-wm (gameagent branch)
-#   2. Installs inference-only pip deps (no training stack)
-#   3. Downloads the trained checkpoint from HuggingFace
-#   4. Starts lewm_cloud_server.py on port 8000
+#   2. Installs inference-only pip deps (fast — no training stack)
+#   3. Finds your checkpoint, fails clearly if it is missing
+#   4. Optionally regenerates candidates from the real dataset (if .h5 uploaded)
+#   5. Starts lewm_cloud_server.py on port 8000
 #
-# ─── SECRETS (set in Lightning AI UI: Studio → menu → "Secrets") ─────────────
-#   HF_TOKEN    → HuggingFace token (hf.co → Settings → Access Tokens)
-#                 Needed if your checkpoint repo is private.
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# ─── ONE-TIME CHECKPOINT UPLOAD (do this from your local machine) ─────────────
-#   pip install huggingface_hub
-#   huggingface-cli upload choudharysarthak-6/gameagent-lewm \
-#       /path/to/weights_epoch_100.pt weights_epoch_100.pt \
-#       --repo-type model
-#
-#   OR upload all epochs at once:
-#   for f in weights_epoch_9*.pt weights_epoch_100.pt; do
-#     huggingface-cli upload choudharysarthak-6/gameagent-lewm "$f" "$f" --repo-type model
-#   done
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# Optional overrides (set before running):
-#   export HF_CHECKPOINT_REPO=choudharysarthak-6/gameagent-lewm
-#   export CHECKPOINT_FILE=weights_epoch_100.pt
+# ─── Override defaults with env vars before running ──────────────────────────
+#   export CHECKPOINT_PATH=/teamspace/studios/this_studio/weights_epoch_100.pt
+#   export HDF5_PATH=/teamspace/studios/this_studio/gameagent.h5
 #   export SERVER_PORT=8000
+#   bash run_server_lightning.sh
 # =============================================================================
 
 set -eo pipefail
 
-# ── Config ─────────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────────
 GAMEAGENT_REPO="https://github.com/sarthakChy/GameAgent.git"
 GAMEAGENT_BRANCH="LeWM"
 LEWM_REPO="https://github.com/sarthakChy/le-wm.git"
 LEWM_BRANCH="gameagent"
 
-HF_CHECKPOINT_REPO="${HF_CHECKPOINT_REPO:-choudharysarthak-6/gameagent-lewm}"
-CHECKPOINT_FILE="${CHECKPOINT_FILE:-weights_epoch_100.pt}"
-CHECKPOINT_DIR="$HOME/checkpoints/lewm"
-CHECKPOINT_PATH="$CHECKPOINT_DIR/$CHECKPOINT_FILE"
+# Path to the .pt file you uploaded manually
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-/teamspace/studios/this_studio/weights_epoch_100.pt}"
+
+# Path to the .h5 file you uploaded manually (optional)
+HDF5_PATH="${HDF5_PATH:-/teamspace/studios/this_studio/gameagent.h5}"
 
 VOCAB_PATH="GameAgent/data_processing/outputs/action_vocab.json"
 CANDIDATES_PATH="le-wm/candidates/gameagent_actions.txt"
 LEWM_DIR="le-wm"
-
 SERVER_PORT="${SERVER_PORT:-8000}"
 
+# auto = extract from HDF5 if present, else use 291 cloned candidates
+# yes  = always extract (fails if HDF5 missing)
+# no   = always use cloned candidates
+GEN_CANDIDATES="${GEN_CANDIDATES:-auto}"
+
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
-ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
-warn() { echo -e "  ${YELLOW}⚠${NC} $1"; }
-die()  { echo -e "  ${RED}✗${NC} $1"; exit 1; }
+ok()   { echo -e "  ${GREEN}ok${NC}  $1"; }
+warn() { echo -e "  ${YELLOW}!!${NC}  $1"; }
+die()  { echo -e "  ${RED}ERR${NC} $1"; exit 1; }
 
-# ── [0/4] Auth ──────────────────────────────────────────────────────────────
-echo ""
-echo "=== [0/4] Checking auth ==="
-
-if [ -n "${HF_TOKEN:-}" ]; then
-    python -c "from huggingface_hub import login; login(token='$HF_TOKEN', add_to_git_credential=False)" 2>/dev/null
-    ok "HuggingFace logged in"
-else
-    warn "HF_TOKEN not set — checkpoint download may fail if repo is private"
-    warn "Add HF_TOKEN in Lightning AI: Studio → menu → Secrets"
-fi
-
-# ── [1/4] Clone repos ───────────────────────────────────────────────────────
+# ── [1/4] Clone repos ────────────────────────────────────────────────────────
 echo ""
 echo "=== [1/4] Cloning repos ==="
 
 if [ -d "GameAgent" ]; then
     warn "GameAgent/ already exists — pulling latest"
-    git -C GameAgent pull --ff-only 2>/dev/null && ok "GameAgent updated" || warn "GameAgent pull skipped (local changes?)"
+    git -C GameAgent pull --ff-only 2>/dev/null && ok "GameAgent updated" || warn "pull skipped (local changes?)"
 else
     git clone --branch "$GAMEAGENT_BRANCH" --depth 1 "$GAMEAGENT_REPO" GameAgent
     ok "GameAgent cloned (branch: $GAMEAGENT_BRANCH)"
@@ -83,132 +65,98 @@ fi
 
 if [ -d "le-wm" ]; then
     warn "le-wm/ already exists — pulling latest"
-    git -C le-wm pull --ff-only 2>/dev/null && ok "le-wm updated" || warn "le-wm pull skipped (local changes?)"
+    git -C le-wm pull --ff-only 2>/dev/null && ok "le-wm updated" || warn "pull skipped (local changes?)"
 else
     git clone --branch "$LEWM_BRANCH" --depth 1 "$LEWM_REPO" le-wm
     ok "le-wm cloned (branch: $LEWM_BRANCH)"
 fi
 
-# ── [2/4] Install inference deps ───────────────────────────────────────────
+# ── [2/4] Install inference deps ─────────────────────────────────────────────
 echo ""
 echo "=== [2/4] Installing deps ==="
 
-# le-wm repo deps (stable-pretraining, stable-worldmodel)
 if [ -f "le-wm/requirements.txt" ]; then
     pip install -q -r le-wm/requirements.txt
 fi
 
-# GameAgent inference deps
 pip install -q \
     fastapi \
-    uvicorn[standard] \
+    "uvicorn[standard]" \
     python-multipart \
     pillow \
     numpy \
-    einops \
-    huggingface_hub
+    einops
 
 ok "deps installed"
 
-# ── [3/4] Download checkpoint ───────────────────────────────────────────────
+# ── [3/4] Locate checkpoint ──────────────────────────────────────────────────
 echo ""
-echo "=== [3/4] Downloading checkpoint ==="
+echo "=== [3/4] Locating checkpoint ==="
 
-mkdir -p "$CHECKPOINT_DIR"
-
-if [ -f "$CHECKPOINT_PATH" ]; then
-    ok "Checkpoint already present: $CHECKPOINT_PATH"
-else
-    echo "  Downloading $CHECKPOINT_FILE from HF repo: $HF_CHECKPOINT_REPO"
-
-    python - <<PYEOF
-from huggingface_hub import hf_hub_download
-import shutil, os
-
-local = hf_hub_download(
-    repo_id="$HF_CHECKPOINT_REPO",
-    filename="$CHECKPOINT_FILE",
-    repo_type="model",
-    local_dir="$CHECKPOINT_DIR",
-)
-print(f"  Downloaded to: {local}")
-PYEOF
-
-    if [ -f "$CHECKPOINT_PATH" ]; then
-        ok "Checkpoint downloaded: $CHECKPOINT_PATH"
-    else
-        die "Checkpoint download failed. Check HF_TOKEN and repo name: $HF_CHECKPOINT_REPO"
-    fi
+if [ ! -f "$CHECKPOINT_PATH" ]; then
+    echo ""
+    die "Checkpoint not found at: $CHECKPOINT_PATH
+    Upload weights_epoch_100.pt to the studio, then:
+      export CHECKPOINT_PATH=/path/to/weights_epoch_100.pt
+      bash run_server_lightning.sh"
 fi
 
-# Verify the checkpoint is readable
 python -c "
-import torch
+import torch, sys
 ckpt = torch.load('$CHECKPOINT_PATH', map_location='cpu', weights_only=True)
-keys = list(ckpt.keys()) if isinstance(ckpt, dict) else ['<raw tensor>']
-print(f'  Checkpoint keys: {keys[:5]}')
-print(f'  Checkpoint size: {sum(p.numel() for p in [v for v in ckpt.values() if hasattr(v, \"numel\")] )/ 1e6:.1f}M params')
-" && ok "Checkpoint verified" || warn "Could not verify checkpoint — server will try anyway"
+n = sum(v.numel() for v in ckpt.values() if hasattr(v, 'numel'))
+print(f'  params: {n/1e6:.1f}M   top keys: {list(ckpt.keys())[:3]}')
+" && ok "Checkpoint OK: $CHECKPOINT_PATH" || warn "Could not read checkpoint — will try anyway"
 
-# ── [3.5] Optional: extract candidates from real dataset ─────────────────────
-# This step runs automatically IF gameagent.h5 is already on disk
-# (e.g. from a previous setup_lightning.sh run or a manual upload).
-# If the HDF5 is absent, the 291 systematic candidates cloned from le-wm are used.
-HDF5_PATH="${HDF5_PATH:-$HOME/stable-wm/datasets/gameagent.h5}"
-GEN_CANDIDATES="${GEN_CANDIDATES:-auto}"   # auto | yes | no
-
+# ── [3.5] Candidates ─────────────────────────────────────────────────────────
 echo ""
 echo "=== [3.5] Candidates ==="
 
 _should_gen=false
-if [ "$GEN_CANDIDATES" = "yes" ]; then
+if   [ "$GEN_CANDIDATES" = "yes" ]; then
     _should_gen=true
 elif [ "$GEN_CANDIDATES" = "auto" ] && [ -f "$HDF5_PATH" ]; then
     _should_gen=true
 fi
 
 if [ "$_should_gen" = true ]; then
-    if [ -f "$HDF5_PATH" ]; then
-        echo "  HDF5 found: $HDF5_PATH"
-        echo "  Extracting top-300 candidates from real dataset..."
-        python GameAgent/scripts/generate_candidates.py \
-            --mode   dataset \
-            --hdf5   "$HDF5_PATH" \
-            --vocab  "$VOCAB_PATH" \
-            --top-n  300 \
-            --out    "$CANDIDATES_PATH"
-        ok "Dataset-extracted candidates written → $CANDIDATES_PATH"
-    else
-        warn "HDF5 not found at $HDF5_PATH"
-        warn "Skipping dataset extraction — to force it:"
-        warn "  export GEN_CANDIDATES=yes HDF5_PATH=/your/path/to/gameagent.h5"
-        warn "  bash run_server_lightning.sh"
-        echo "  Using systematic candidates already in the cloned repo (291 actions)"
-        ok "Candidates: $CANDIDATES_PATH"
-    fi
+    [ -f "$HDF5_PATH" ] || die "HDF5 not found: $HDF5_PATH
+    Upload gameagent.h5 or run with GEN_CANDIDATES=no to skip extraction."
+
+    echo "  gameagent.h5 found — extracting top-300 real candidates..."
+    python GameAgent/scripts/generate_candidates.py \
+        --mode  dataset \
+        --hdf5  "$HDF5_PATH" \
+        --vocab "$VOCAB_PATH" \
+        --top-n 300 \
+        --out   "$CANDIDATES_PATH"
+    ok "Dataset candidates written: $CANDIDATES_PATH"
 else
-    candidate_count=$(grep -c '^[^#]' "$CANDIDATES_PATH" 2>/dev/null || echo "?")
-    ok "Using cloned candidates ($candidate_count actions) — set GEN_CANDIDATES=yes to regenerate from HDF5"
+    cnt=$(grep -c '^[^#]' "$CANDIDATES_PATH" 2>/dev/null || echo "?")
+    ok "Using cloned candidates ($cnt actions)"
+    if [ ! -f "$HDF5_PATH" ]; then
+        warn "gameagent.h5 not found — upload it to get dataset-extracted candidates"
+        warn "or set: export GEN_CANDIDATES=no  to silence this warning"
+    fi
 fi
 
-# ── [4/4] Start server ──────────────────────────────────────────────────────
+# ── [4/4] Start server ───────────────────────────────────────────────────────
 echo ""
 echo "=== [4/4] Starting LeWM inference server ==="
 echo ""
-echo "  Checkpoint : $CHECKPOINT_PATH"
-echo "  Vocab      : $VOCAB_PATH"
-echo "  Candidates : $CANDIDATES_PATH"
-echo "  Port       : $SERVER_PORT"
+printf "  Checkpoint : %s\n" "$CHECKPOINT_PATH"
+printf "  Vocab      : %s\n" "$VOCAB_PATH"
+printf "  Candidates : %s\n" "$CANDIDATES_PATH"
+printf "  Port       : %s\n" "$SERVER_PORT"
 echo ""
-echo "  ─── Get your public URL from Lightning AI UI ───"
-echo "  Teamspace → your studio → 'Open Port' → enter $SERVER_PORT"
-echo "  Copy the URL and paste it into tools/lewm_local_client.py as CLOUD_URL"
-echo "  ────────────────────────────────────────────────"
+echo "  ── Get your public URL ────────────────────────────────────────────"
+echo "  Lightning AI UI -> your studio -> 'Open Port' -> $SERVER_PORT"
+echo "  Paste that URL into tools/lewm_local_client.py  (CLOUD_URL line)"
+echo "  ───────────────────────────────────────────────────────────────────"
 echo ""
 
-# Abort if vocab doesn't exist
-[ -f "$VOCAB_PATH" ] || die "Vocab not found: $VOCAB_PATH — is GameAgent cloned correctly?"
-[ -f "$CANDIDATES_PATH" ] || warn "Candidates file not found: $CANDIDATES_PATH — server will use built-in fallback"
+[ -f "$VOCAB_PATH" ]      || die "Vocab not found: $VOCAB_PATH — is GameAgent cloned correctly?"
+[ -f "$CANDIDATES_PATH" ] || warn "Candidates file missing — server will use a built-in fallback"
 
 python GameAgent/lewm_cloud_server.py \
     --checkpoint "$CHECKPOINT_PATH" \
