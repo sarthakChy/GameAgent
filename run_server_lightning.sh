@@ -150,6 +150,47 @@ print(f'  Checkpoint keys: {keys[:5]}')
 print(f'  Checkpoint size: {sum(p.numel() for p in [v for v in ckpt.values() if hasattr(v, \"numel\")] )/ 1e6:.1f}M params')
 " && ok "Checkpoint verified" || warn "Could not verify checkpoint — server will try anyway"
 
+# ── [3.5] Optional: extract candidates from real dataset ─────────────────────
+# This step runs automatically IF gameagent.h5 is already on disk
+# (e.g. from a previous setup_lightning.sh run or a manual upload).
+# If the HDF5 is absent, the 291 systematic candidates cloned from le-wm are used.
+HDF5_PATH="${HDF5_PATH:-$HOME/stable-wm/datasets/gameagent.h5}"
+GEN_CANDIDATES="${GEN_CANDIDATES:-auto}"   # auto | yes | no
+
+echo ""
+echo "=== [3.5] Candidates ==="
+
+_should_gen=false
+if [ "$GEN_CANDIDATES" = "yes" ]; then
+    _should_gen=true
+elif [ "$GEN_CANDIDATES" = "auto" ] && [ -f "$HDF5_PATH" ]; then
+    _should_gen=true
+fi
+
+if [ "$_should_gen" = true ]; then
+    if [ -f "$HDF5_PATH" ]; then
+        echo "  HDF5 found: $HDF5_PATH"
+        echo "  Extracting top-300 candidates from real dataset..."
+        python GameAgent/scripts/generate_candidates.py \
+            --mode   dataset \
+            --hdf5   "$HDF5_PATH" \
+            --vocab  "$VOCAB_PATH" \
+            --top-n  300 \
+            --out    "$CANDIDATES_PATH"
+        ok "Dataset-extracted candidates written → $CANDIDATES_PATH"
+    else
+        warn "HDF5 not found at $HDF5_PATH"
+        warn "Skipping dataset extraction — to force it:"
+        warn "  export GEN_CANDIDATES=yes HDF5_PATH=/your/path/to/gameagent.h5"
+        warn "  bash run_server_lightning.sh"
+        echo "  Using systematic candidates already in the cloned repo (291 actions)"
+        ok "Candidates: $CANDIDATES_PATH"
+    fi
+else
+    candidate_count=$(grep -c '^[^#]' "$CANDIDATES_PATH" 2>/dev/null || echo "?")
+    ok "Using cloned candidates ($candidate_count actions) — set GEN_CANDIDATES=yes to regenerate from HDF5"
+fi
+
 # ── [4/4] Start server ──────────────────────────────────────────────────────
 echo ""
 echo "=== [4/4] Starting LeWM inference server ==="
