@@ -14,24 +14,26 @@
 # ─── ONE-TIME UPLOAD (run from your local machine) ───────────────────────────
 #   pip install huggingface_hub
 #
-#   # Create the model repo on HuggingFace first (if it doesn't exist):
+#   # Create both repos:
 #   huggingface-cli repo create valheim-gameagent-lewm --type model
+#   huggingface-cli repo create valheim-gameagent-data --type dataset
 #
-#   # Upload checkpoint (a few hundred MB):
+#   # Upload checkpoint to the MODEL repo:
 #   huggingface-cli upload sarthak2314/valheim-gameagent-lewm \
 #       /path/to/weights_epoch_100.pt weights_epoch_100.pt \
 #       --repo-type model
 #
-#   # Upload dataset (8 GB — HF handles LFS automatically, takes a few mins):
-#   huggingface-cli upload sarthak2314/valheim-gameagent-lewm \
+#   # Upload HDF5 to the DATASET repo (8 GB — HF handles LFS automatically):
+#   huggingface-cli upload sarthak2314/valheim-gameagent-data \
 #       /path/to/gameagent.h5 gameagent.h5 \
-#       --repo-type model
+#       --repo-type dataset
 #
 # ─── SECRETS (Lightning AI UI: Studio -> menu -> "Secrets") ──────────────────
 #   HF_TOKEN  ->  your HuggingFace token  (hf.co -> Settings -> Access Tokens)
 #
 # ─── Optional env overrides ──────────────────────────────────────────────────
-#   export HF_REPO=sarthak2314/valheim-gameagent-lewm
+#   export HF_MODEL_REPO=sarthak2314/valheim-gameagent-lewm
+#   export HF_DATA_REPO=sarthak2314/valheim-gameagent-data
 #   export CHECKPOINT_FILE=weights_epoch_100.pt
 #   export HDF5_FILE=gameagent.h5
 #   export SERVER_PORT=8000
@@ -47,7 +49,8 @@ GAMEAGENT_BRANCH="LeWM"
 LEWM_REPO="https://github.com/sarthakChy/le-wm.git"
 LEWM_BRANCH="gameagent"
 
-HF_REPO="${HF_REPO:-sarthak2314/valheim-gameagent-lewm}"
+HF_MODEL_REPO="${HF_MODEL_REPO:-sarthak2314/valheim-gameagent-lewm}"   # .pt lives here
+HF_DATA_REPO="${HF_DATA_REPO:-sarthak2314/valheim-gameagent-data}"    # .h5 lives here
 CHECKPOINT_FILE="${CHECKPOINT_FILE:-weights_epoch_100.pt}"
 HDF5_FILE="${HDF5_FILE:-gameagent.h5}"
 
@@ -125,41 +128,52 @@ ok "deps installed"
 
 # ── [3/5] Download files from HuggingFace ────────────────────────────────────
 echo ""
-echo "=== [3/5] Downloading from HuggingFace: $HF_REPO ==="
+echo "=== [3/5] Downloading from HuggingFace ==="
+echo "  model repo : $HF_MODEL_REPO"
+echo "  data  repo : $HF_DATA_REPO"
 
 mkdir -p "$DOWNLOAD_DIR"
 
-# Enable fast multi-part downloads (makes the 8GB HDF5 much faster)
+# Enable fast multi-part downloads (hf_transfer makes the 8 GB HDF5 much faster)
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 python - <<PYEOF
-import os, sys
+import os
 from huggingface_hub import hf_hub_download
 
-repo  = "$HF_REPO"
-dst   = "$DOWNLOAD_DIR"
+dst = "$DOWNLOAD_DIR"
 
-files_to_download = [
-    ("$CHECKPOINT_FILE", False),  # (filename, already_present_skip)
-    ("$HDF5_FILE",       False),
-]
-
-for fname, _ in files_to_download:
-    target = os.path.join(dst, fname)
-    if os.path.exists(target):
-        size_gb = os.path.getsize(target) / 1e9
-        print(f"  already present: {fname} ({size_gb:.2f} GB)")
-        continue
-    print(f"  downloading {fname} from {repo} ...")
+# ── checkpoint from MODEL repo ──
+fname = "$CHECKPOINT_FILE"
+target = os.path.join(dst, fname)
+if os.path.exists(target):
+    print(f"  already present: {fname} ({os.path.getsize(target)/1e9:.2f} GB)")
+else:
+    print(f"  downloading {fname} from model repo ...")
     local = hf_hub_download(
-        repo_id=repo,
+        repo_id="$HF_MODEL_REPO",
         filename=fname,
         repo_type="model",
         local_dir=dst,
-        local_dir_use_symlinks=False,   # copy, not symlink — avoids LFS issues
+        local_dir_use_symlinks=False,
     )
-    size_gb = os.path.getsize(local) / 1e9
-    print(f"  done: {local} ({size_gb:.2f} GB)")
+    print(f"  done: {local} ({os.path.getsize(local)/1e9:.2f} GB)")
+
+# ── HDF5 from DATASET repo ──
+fname = "$HDF5_FILE"
+target = os.path.join(dst, fname)
+if os.path.exists(target):
+    print(f"  already present: {fname} ({os.path.getsize(target)/1e9:.2f} GB)")
+else:
+    print(f"  downloading {fname} from dataset repo (8 GB — grab a coffee) ...")
+    local = hf_hub_download(
+        repo_id="$HF_DATA_REPO",
+        filename=fname,
+        repo_type="dataset",
+        local_dir=dst,
+        local_dir_use_symlinks=False,
+    )
+    print(f"  done: {local} ({os.path.getsize(local)/1e9:.2f} GB)")
 PYEOF
 
 [ -f "$CHECKPOINT_PATH" ] || die "Checkpoint download failed: $CHECKPOINT_PATH"
@@ -212,7 +226,8 @@ fi
 echo ""
 echo "=== [5/5] Starting Valheim LeWM inference server ==="
 echo ""
-printf "  Repo       : %s\n" "$HF_REPO"
+printf "  Model repo : %s\n" "$HF_MODEL_REPO"
+printf "  Data  repo : %s\n" "$HF_DATA_REPO"
 printf "  Checkpoint : %s\n" "$CHECKPOINT_PATH"
 printf "  Vocab      : %s\n" "$VOCAB_PATH"
 printf "  Candidates : %s\n" "$CANDIDATES_PATH"
